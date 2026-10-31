@@ -13,6 +13,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from backend.app.governance.identity import authorized_source_ids_for
 from backend.app.graph.models import Entity, Evidence
 from backend.app.graph.repository import GraphRepository
 from backend.app.security import AuthorizationContext, Permission
@@ -35,7 +36,22 @@ def _repository(context: AuthorizationContext, dependencies: ToolDependencies) -
     return GraphRepository(
         dependencies.graph_store, context.tenant_id, context.workspace_id, context.principal.subject,
         allow_all=allow_all, can_evidence=can_evidence, authority_rules=dependencies.authority_rules,
+        authorized_source_ids=_scoped_source_ids(context),
     )
+
+
+def _scoped_source_ids(context: AuthorizationContext) -> frozenset[str] | None:
+    """See ``backend.app.tools.graph_tools._scoped_source_ids`` (Stage 11
+    ND-11A): additionally intersects an explicit, caller-selected
+    ``principal.source_ids`` set into the read scope, for any tenant, on top
+    of whatever ``authorized_source_ids_for`` already restricts."""
+    governance_scope = authorized_source_ids_for(context.principal)
+    selection_scope = frozenset(context.principal.source_ids) if context.principal.source_ids else None
+    if governance_scope is None:
+        return selection_scope
+    if selection_scope is None:
+        return governance_scope
+    return governance_scope & selection_scope
 
 
 class EvidenceLookupInput(BaseModel):

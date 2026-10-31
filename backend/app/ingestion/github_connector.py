@@ -48,7 +48,7 @@ class GitHubConnector:
         return ConnectorCapabilities(supports_incremental=True, supports_deletion_detection=False, paginated=True)
 
     def _headers(self, config: ConnectorConfig) -> dict[str, str]:
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "GraphHacks",
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "NODUS",
                    "X-GitHub-Api-Version": "2022-11-28"}
         token_env = config.settings.get("token_env")
         token = os.getenv(token_env) if token_env else None

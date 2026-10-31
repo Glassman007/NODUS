@@ -47,7 +47,8 @@ class GraphRepository:
 
     def __init__(self, store: Neo4jStore, tenant_id: str, workspace_id: str,
                  subject: str, allow_all: bool = False, can_evidence: bool = False,
-                 authority_rules: tuple[AuthorityRule, ...] = ()):
+                 authority_rules: tuple[AuthorityRule, ...] = (),
+                 authorized_source_ids: frozenset[str] | None = None):
         if not tenant_id or not workspace_id or not subject:
             raise ValueError("Tenant, workspace and subject are required")
         self.store = store
@@ -57,11 +58,20 @@ class GraphRepository:
         self.allow_all = allow_all
         self.can_evidence = can_evidence or allow_all
         self.authority_rules = authority_rules
+        # None preserves prior behavior exactly (no source restriction beyond
+        # acl_subjects) — every existing caller that doesn't pass this gets the
+        # unchanged query plan. A non-None set additionally requires the
+        # asserting/relating SourceRecord's own source_id to be a member,
+        # independent of and in addition to the acl_subjects allowlist.
+        self.authorized_source_ids = authorized_source_ids
 
     def _params(self) -> dict[str, Any]:
         return dict(tenant=self.tenant_id, workspace=self.workspace_id,
                     subject=self.subject, allow_all=self.allow_all,
-                    as_of=iso(datetime.now(timezone.utc)))
+                    as_of=iso(datetime.now(timezone.utc)),
+                    authorized_sources=(
+                        sorted(self.authorized_source_ids)
+                        if self.authorized_source_ids is not None else None))
 
     def _revision_key(self) -> str:
         return scoped_key(self.tenant_id, self.workspace_id, "graph_revision")
@@ -146,6 +156,7 @@ class GraphRepository:
               AND s.tenant_id=$tenant AND s.workspace_id=$workspace
               AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
               AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
+              AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
             RETURN e.public_id AS id, a, s.active AS source_active, s.source_id AS source_id
             """, key=key, history=history, **self._params()))
         if not rows:
@@ -172,6 +183,7 @@ class GraphRepository:
                       -[a:ASSERTS]->(e:Entity {key:$key, tenant_id:$tenant, workspace_id:$workspace})
                 WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s, a ORDER BY s.source_id, s.record_id, a.observed_at DESC LIMIT $fetch
                 """, key=key, **self._params(), fetch=limit + 1))
             items = []
@@ -352,6 +364,7 @@ class GraphRepository:
                   AND (a.valid_to IS NULL OR a.valid_to > $as_of)
                   AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 WITH e, collect({type:a.type, name:a.name, description:a.description, source_id:s.source_id}) AS claims
                 WHERE toLower(e.public_id) CONTAINS $needle
                    OR any(claim IN claims WHERE toLower(claim.name) CONTAINS $needle)
@@ -364,7 +377,13 @@ class GraphRepository:
         return self.store.read(work)
 
     def neighborhood(self, entity_id: str, limit: int = 50,
-                     include_history: bool = False, reverse_only: bool = False) -> GraphPage:
+                     include_history: bool = False, reverse_only: bool = False,
+                     reverse_relation_type: str = "DEPENDS_ON") -> GraphPage:
+        """``reverse_relation_type`` only applies when ``reverse_only`` is set;
+        it generalizes what was previously a DEPENDS_ON-only reverse lookup
+        (still the default, so every existing caller is unaffected) to any
+        single directed relation type -- e.g. ``blockers_of`` reuses this for
+        BLOCKS instead of introducing a second traversal engine."""
         if not 1 <= limit <= 100:
             raise ValueError("Invalid limit")
         key = scoped_key(self.tenant_id, self.workspace_id, entity_id)
@@ -379,16 +398,17 @@ class GraphRepository:
                   AND ($history OR (r.active=true
                     AND (r.valid_from IS NULL OR r.valid_from <= $as_of)
                     AND (r.valid_to IS NULL OR r.valid_to > $as_of)))
-                  AND (NOT $reverse OR (endNode(r)=root AND type(r)='DEPENDS_ON'))
+                  AND (NOT $reverse OR (endNode(r)=root AND type(r)=$reverse_type))
                   AND EXISTS {
                     MATCH (source:SourceRecord {key:r.record_key, tenant_id:$tenant, workspace_id:$workspace})
                     WHERE $allow_all OR size(source.acl_subjects)=0 OR $subject IN source.acl_subjects
                   }
                   AND ($allow_all OR size(coalesce(r.acl_subjects, []))=0 OR $subject IN r.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR r.source_id IN $authorized_sources)
                 RETURN startNode(r).public_id AS source_id, endNode(r).public_id AS target_id, r
                 ORDER BY r.active DESC, type(r), r.key LIMIT $fetch
                 """, key=key, **self._params(), history=include_history,
-                reverse=reverse_only, fetch=limit + 1))
+                reverse=reverse_only, reverse_type=reverse_relation_type, fetch=limit + 1))
             nodes: dict[str, Entity] = {}
             edges: list[Relationship] = []
             for row in rows[:limit]:
@@ -407,6 +427,16 @@ class GraphRepository:
     def reverse_dependencies(self, entity_id: str, limit: int = 50) -> GraphPage:
         return self.neighborhood(entity_id, limit=limit, reverse_only=True)
 
+    def blockers_of(self, entity_id: str, limit: int = 50, include_history: bool = False) -> GraphPage:
+        """ND-12B: entities with a BLOCKS edge targeting ``entity_id`` -- i.e.
+        work that must be addressed before ``entity_id`` can proceed. Same
+        traversal engine and authorization guarantees as
+        ``reverse_dependencies`` (a blocker whose own source record is not
+        authorized for the caller is silently excluded by
+        ``neighborhood``'s existing node-resolution check, never revealed)."""
+        return self.neighborhood(entity_id, limit=limit, include_history=include_history,
+                                 reverse_only=True, reverse_relation_type="BLOCKS")
+
     def relationship(self, relation_id: str) -> Relationship | None:
         def work(tx):
             row = tx.run("""
@@ -420,6 +450,7 @@ class GraphRepository:
                     WHERE $allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects
                   }
                   AND ($allow_all OR size(coalesce(r.acl_subjects, []))=0 OR $subject IN r.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR r.source_id IN $authorized_sources)
                 RETURN a.public_id AS source_id, b.public_id AS target_id, r
                 """, key=relation_id, **self._params()).single()
             if row is None:
@@ -475,6 +506,7 @@ class GraphRepository:
                       -[a:ASSERTS {active:true}]->(e:Entity {key:$key, tenant_id:$tenant, workspace_id:$workspace})
                 WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                   AND (a.valid_from IS NULL OR a.valid_from <= $as_of)
                   AND (a.valid_to IS NULL OR a.valid_to > $as_of)
                 RETURN DISTINCT s ORDER BY s.source_id, s.record_id LIMIT $fetch
@@ -491,7 +523,8 @@ class GraphRepository:
         def work(tx):
             rows = list(tx.run("""
                 MATCH (s:SourceRecord {tenant_id:$tenant, workspace_id:$workspace, active:true})
-                WHERE $allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects
+                WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s.source_id AS id, count(s) AS records ORDER BY id LIMIT $fetch
                 """, **self._params(), fetch=limit + 1))
             return {"items": [dict(row) for row in rows[:limit]], "truncated": len(rows) > limit}
@@ -504,7 +537,8 @@ class GraphRepository:
         def work(tx):
             row = tx.run("""
                 MATCH (s:SourceRecord {key:$key, tenant_id:$tenant, workspace_id:$workspace, active:true})
-                WHERE $allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects
+                WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
+                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s
                 """, key=key, **self._params()).single()
             if row is None:

@@ -31,13 +31,47 @@ from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 
-from backend.app.agent.run_state import SkillAlreadySelectedError, current_run
+from backend.app.agent.run_state import RunState, SkillAlreadySelectedError, current_run
+from backend.app.governance.identity import refresh_principal_source_ids
+from backend.app.governance.store import GovernanceStore
+from backend.app.security import AuthorizationContext
 from backend.app.skills.errors import (
     RevokedSkillError, SkillIntegrityError, UnknownSkillVersionError, UntrustedSkillError,
 )
 from backend.app.skills.registry import SkillRegistry
 from backend.app.tools.contracts import ToolInvocation
+from backend.app.tools.executor import ToolExecutor
 from backend.app.tools.registry import SideEffect, ToolRegistry, ToolSpec
+
+
+def refresh_authorization(context: AuthorizationContext, tool_executor: ToolExecutor) -> AuthorizationContext:
+    """The ``AuthorizationContext`` to use for the NEXT tool call, or the next
+    specialist pass of a coordinated investigation (see
+    ``backend/app/agent/coordinator.py``).
+
+    ``AgentExecutionContext`` is built once at run start, but a run — or a
+    multi-specialist coordinated investigation spanning several runs — can
+    span many tool calls over its full budget. If a NEXUS identity's grant is
+    revoked or expires in the meantime, the stale snapshot must not keep
+    authorizing what follows. When a ``GovernanceStore`` is available (NEXUS
+    deployments only), the principal's role/source access is re-resolved
+    fresh from live governance state before every call; otherwise (no
+    governance store configured) the original context is returned unchanged,
+    matching prior behavior exactly.
+    """
+    store = tool_executor.dependencies.governance_store
+    if not isinstance(store, GovernanceStore):
+        return context
+    refreshed_principal = refresh_principal_source_ids(context.principal, store)
+    if refreshed_principal.source_ids == context.principal.source_ids and \
+            refreshed_principal.permissions == context.principal.permissions:
+        return context
+    narrowed_permissions = context.permissions & refreshed_principal.permissions
+    return context.model_copy(update={
+        "principal": refreshed_principal,
+        "permissions": narrowed_permissions,
+        "approved_permissions": context.approved_permissions & narrowed_permissions,
+    })
 
 
 def _adk_name(tool_id: str) -> str:
@@ -164,7 +198,8 @@ class DeterministicToolAdapter(BaseTool):
 
         invocation = ToolInvocation(
             tool_id=self.spec.tool_id, version=self.spec.version, arguments=args or {},
-            context=run_state.exec_context.authorization, correlation_id=run_state.exec_context.run_id,
+            context=refresh_authorization(run_state.exec_context.authorization, run_state.tool_executor),
+            correlation_id=run_state.exec_context.run_id,
         )
         result = run_state.tool_executor.execute(invocation)
         run_state.record_tool_result(self.spec.tool_id, self.spec.version, result, arguments=args)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from backend.app.governance.identity import authorized_source_ids_for
 from backend.app.graph.models import Entity, Relationship
 from backend.app.graph.repository import GraphRepository
 from backend.app.security import AuthorizationContext, Permission
@@ -152,7 +153,27 @@ def _repository(context: AuthorizationContext, dependencies: ToolDependencies) -
     return GraphRepository(
         dependencies.graph_store, context.tenant_id, context.workspace_id, context.principal.subject,
         allow_all=allow_all, can_evidence=can_evidence, authority_rules=dependencies.authority_rules,
+        authorized_source_ids=_scoped_source_ids(context),
     )
+
+
+def _scoped_source_ids(context: AuthorizationContext) -> frozenset[str] | None:
+    """Stage 11 (ND-11A): ``authorized_source_ids_for`` alone only restricts a
+    NEXUS-resolved principal. ``AgentExecutionContext.authorization.principal``
+    may additionally carry an explicit, caller-selected ``source_ids`` set
+    narrowed to ``selected source_ids ∩ principal's authorized source_ids``
+    (see ``backend/app/agent/discovery.py``'s ``effective_source_scope``) even
+    for a non-NEXUS principal; when present, this intersects that selection
+    into the read scope too, so an unselected source never reaches a tool
+    result regardless of tenant. A principal with no explicit ``source_ids``
+    keeps exactly its prior behavior (``authorized_source_ids_for`` alone)."""
+    governance_scope = authorized_source_ids_for(context.principal)
+    selection_scope = frozenset(context.principal.source_ids) if context.principal.source_ids else None
+    if governance_scope is None:
+        return selection_scope
+    if selection_scope is None:
+        return governance_scope
+    return governance_scope & selection_scope
 
 
 def register_graph_tools(registry: ToolRegistry) -> None:

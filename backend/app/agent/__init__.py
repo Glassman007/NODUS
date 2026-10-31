@@ -2,8 +2,7 @@
 
 Single-agent only: one Google ADK ``LlmAgent``/``Runner`` pair per
 investigation run. No multi-agent coordination, no Temporal workflow, no
-handoff contract — those are reserved for Stages 07/08 (see
-``docs/IMPLEMENTATION_ROADMAP.md``).
+handoff contract yet.
 
 This package is a thin integration layer. It does not duplicate:
 - model calling, routing, budget or retry logic (``backend.app.gateway``),

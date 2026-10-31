@@ -1,4 +1,4 @@
-# VERINEX / GraphHacks
+# NODUS
 # Commit code, dependency manifests/lockfiles, migrations, synthetic seed data,
 # tests, Docker/Compose configuration, and safe *.example configuration files.
 # Do not commit live secrets, local databases, generated reports, or runtime state.
@@ -215,11 +215,6 @@ docs/*_source_check.txt
 docs/*_collect.txt
 docs/*_targeted.txt
 docs/*_nonintegration*.txt
-
-# Local FalkorDB / Redis persistence (keep migration/seed scripts tracked)
-dump.rdb
-appendonly.aof
-appendonlydir/
 
 # Package-manager caches (do NOT ignore package lockfiles)
 .npm/

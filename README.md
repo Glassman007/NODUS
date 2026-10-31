@@ -1,6 +1,8 @@
-# GraphHacks
+# NODUS
 
-GraphHacks stores source-backed entities and directed relationships in Neo4j Community Edition. Its FastAPI service requires an explicit authenticated tenant and workspace for graph access. A fresh database contains no entities until authorized source records are posted.
+NODUS stores source-backed entities and directed relationships in Neo4j Community Edition. Its FastAPI service requires an explicit authenticated tenant and workspace for graph access. A fresh database contains no entities until authorized source records are posted.
+
+NODUS is moving toward a single-company, objective-driven relationship investigation system: a user states an investigation objective, NODUS discovers relevant relationships, and agents investigate causes, dependencies, risks, and weak links. That direction is not yet implemented — the sections below describe what exists today.
 
 ## Configuration
 

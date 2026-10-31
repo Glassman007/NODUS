@@ -27,6 +27,7 @@ class ToolDependencies:
     graph_store: object | None = None
     authority_rules: tuple = ()
     postgres_store: object | None = None
+    governance_store: object | None = None
 
 
 ToolHandler = Callable[[AuthorizationContext, BaseModel, ToolDependencies], object | None]

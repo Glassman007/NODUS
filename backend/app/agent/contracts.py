@@ -138,7 +138,81 @@ class InvestigationResult(Record):
     unresolved_conflicts: tuple[str, ...] = ()
     source_coverage_limitations: tuple[str, ...] = ()
     rejected_unverified_claims: tuple[str, ...] = ()
+    # Stage 11 (ND-11B/C): the subset of ``relationship_ids`` (already included
+    # there) that this run's deterministic candidate-validation step actually
+    # newly committed to the graph via ``GraphRepository.ingest`` versus found
+    # already current from an earlier run of the same/different objective over
+    # unchanged evidence (``ingest``'s own content-hash idempotency — see
+    # ``backend/app/agent/discovery.py``). Both default empty for every
+    # investigation that never reaches objective-driven discovery (e.g. GH-007A
+    # callers), so this is purely additive.
+    newly_discovered_relationship_ids: tuple[str, ...] = ()
+    reused_relationship_ids: tuple[str, ...] = ()
     skill_used: SkillUsageRecord | None = None
     model_usage: ModelUsageSummary = Field(default_factory=ModelUsageSummary)
     tool_calls: tuple[ToolCallRecord, ...] = ()
+    error_message: str | None = Field(default=None, max_length=1000)
+
+
+class SpecialistRole(StrEnum):
+    """ND-13A bounded specialist roles. See ``backend/app/agent/coordinator.py``."""
+    DISCOVERY = "DISCOVERY"
+    IMPACT = "IMPACT"
+    SYNTHESIS = "SYNTHESIS"
+
+
+class CoordinatorBudget(Record):
+    """The ONE shared budget enforced across every specialist pass of a
+    coordinated investigation (ND-13A section 3). Each pass is handed a
+    ``RuntimeLimits`` carved out of whatever remains here when it starts —
+    never a fresh, independent allowance. Deliberately small defaults, same
+    spirit as ``RuntimeLimits``."""
+    max_total_tool_calls: int = Field(default=16, ge=1, le=200)
+    max_total_llm_calls: int = Field(default=12, ge=1, le=100)
+    overall_timeout_seconds: float = Field(default=150.0, gt=0, le=1200)
+
+
+class SpecialistResult(Record):
+    """The small, structured handoff contract between specialist passes
+    (ND-13A section 5) — never a raw tool payload or conversation history.
+    Built entirely from an already-executed ``InvestigationResult`` (or, for
+    SYNTHESIS, from the prior specialists' own ``SpecialistResult``s) —
+    never from a specialist's free-text narrative."""
+    role: SpecialistRole
+    status: InvestigationStatus
+    skill_used: SkillUsageRecord | None = None
+    entity_ids: tuple[str, ...] = ()
+    relationship_ids: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    graph_revision: int | None = None
+    unresolved_conflicts: tuple[str, ...] = ()
+    source_coverage_limitations: tuple[str, ...] = ()
+    rejected_unverified_claims: tuple[str, ...] = ()
+    summary: str = Field(default="", max_length=4000)
+    tool_calls_made: int = Field(default=0, ge=0)
+    tool_ids_called: tuple[str, ...] = ()
+    llm_calls_made: int = Field(default=0, ge=0)
+    skipped_reason: str | None = Field(default=None, max_length=500)
+
+
+class CoordinatedInvestigationResult(Record):
+    """ND-13A's coordinated-investigation result: what a discovery + impact +
+    synthesis pass over the existing infrastructure actually produced.
+    ``verification_status`` is always ``PENDING_INDEPENDENT_VERIFICATION``
+    here — ND-13A performs no independent verification of synthesized
+    conclusions; that is ND-13B's job (see module docstring of
+    ``backend/app/agent/coordinator.py``)."""
+    run_id: str = Field(min_length=1)
+    status: InvestigationStatus
+    summary: str = Field(min_length=1, max_length=4000)
+    entity_ids: tuple[str, ...] = ()
+    relationship_ids: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    graph_revision: int | None = None
+    unresolved_conflicts: tuple[str, ...] = ()
+    source_coverage_limitations: tuple[str, ...] = ()
+    specialist_results: tuple[SpecialistResult, ...] = ()
+    model_usage: ModelUsageSummary = Field(default_factory=ModelUsageSummary)
+    incomplete_work: tuple[str, ...] = ()
+    verification_status: str = "PENDING_INDEPENDENT_VERIFICATION"
     error_message: str | None = Field(default=None, max_length=1000)

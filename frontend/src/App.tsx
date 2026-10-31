@@ -174,7 +174,7 @@ export function App() {
   }
 
   return <div className="app">
-    <header><strong>GraphHacks</strong><span>Source backed graph explorer</span></header>
+    <header><strong>NODUS</strong><span>Source backed graph explorer</span></header>
     <main>
       <section className="settings">
         <h1>Explore your graph</h1>

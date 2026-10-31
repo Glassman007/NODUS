@@ -27,7 +27,7 @@ def fetch_public_pull_requests(request: GitHubImport) -> list[dict]:
         raise ValueError("Invalid GitHub repository name")
     url = (f"https://api.github.com/repos/{request.owner}/{request.repository}/pulls"
            f"?state=all&per_page={request.max_pull_requests}")
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "GraphHacks"}
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "NODUS"}
     token = os.getenv("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"

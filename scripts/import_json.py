@@ -1,4 +1,4 @@
-"""Import a local JSON source file through the authenticated GraphHacks API."""
+"""Import a local JSON source file through the authenticated NODUS API."""
 
 from __future__ import annotations
 

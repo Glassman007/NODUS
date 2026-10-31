@@ -17,6 +17,15 @@ class EntityType(StrEnum):
     SYSTEM = "SYSTEM"
     EVENT = "EVENT"
     OTHER = "OTHER"
+    PROJECT = "PROJECT"
+    COMMIT = "COMMIT"
+    BUILD = "BUILD"
+    ARTIFACT = "ARTIFACT"
+    DEPLOYMENT = "DEPLOYMENT"
+    PACKAGE = "PACKAGE"
+    CONTRACT = "CONTRACT"
+    GRANT = "GRANT"
+    DECISION = "DECISION"
 
 
 class RelationType(StrEnum):
@@ -33,6 +42,15 @@ class RelationType(StrEnum):
     BLOCKS = "BLOCKS"
     REVIEWED = "REVIEWED"
     REPORTED = "REPORTED"
+    INCLUDED_IN = "INCLUDED_IN"
+    TRIGGERED = "TRIGGERED"
+    PRODUCED = "PRODUCED"
+    DEPLOYED_AS = "DEPLOYED_AS"
+    PROVIDES = "PROVIDES"
+    CONSUMES = "CONSUMES"
+    GRANTS_ACCESS_TO = "GRANTS_ACCESS_TO"
+    DECIDED = "DECIDED"
+    SUPERSEDES = "SUPERSEDES"
 
 
 class AssertionOrigin(StrEnum):

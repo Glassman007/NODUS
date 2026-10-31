@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict
 
 from backend.app.graph.models import AssertionOrigin, EntityType, RelationType
 
-ONTOLOGY_VERSION = "1.2.0"
+ONTOLOGY_VERSION = "1.6.0"
 
 
 class EntityTypeDefinition(BaseModel):
@@ -98,6 +98,48 @@ ENTITY_TYPES: dict[EntityType, EntityTypeDefinition] = {
         type=EntityType.OTHER,
         since_version="1.0.0",
         description="An entity whose connector-supplied type does not yet map to a dedicated ontology type."),
+    EntityType.PROJECT: EntityTypeDefinition(
+        type=EntityType.PROJECT,
+        since_version="1.3.0",
+        description="A product-aligned organizational and ownership boundary composed of teams and services "
+                     "(e.g. a company's product line); distinct from SYSTEM, which is a technical composition "
+                     "of services/repositories rather than an org/ownership unit."),
+    EntityType.COMMIT: EntityTypeDefinition(
+        type=EntityType.COMMIT,
+        since_version="1.3.0",
+        description="A single source-control commit, distinct from the PULL_REQUEST that may include it."),
+    EntityType.BUILD: EntityTypeDefinition(
+        type=EntityType.BUILD,
+        since_version="1.3.0",
+        description="A CI build execution triggered by one or more commits."),
+    EntityType.ARTIFACT: EntityTypeDefinition(
+        type=EntityType.ARTIFACT,
+        since_version="1.3.0",
+        description="A release artifact (e.g. container image) produced by a build execution."),
+    EntityType.DEPLOYMENT: EntityTypeDefinition(
+        type=EntityType.DEPLOYMENT,
+        since_version="1.3.0",
+        description="A recorded deployment of an artifact to a runtime environment."),
+    EntityType.PACKAGE: EntityTypeDefinition(
+        type=EntityType.PACKAGE,
+        since_version="1.3.0",
+        description="A versioned runtime dependency (library/component) recorded in a service's dependency "
+                     "inventory, including transitive dependencies of another package."),
+    EntityType.CONTRACT: EntityTypeDefinition(
+        type=EntityType.CONTRACT,
+        since_version="1.3.0",
+        description="An interface/API contract a service provides or consumes (e.g. an event schema or "
+                     "REST/gRPC interface definition)."),
+    EntityType.GRANT: EntityTypeDefinition(
+        type=EntityType.GRANT,
+        since_version="1.3.0",
+        description="A resource access grant record (identity, scope, validity window), metadata-only — "
+                     "never carries the restricted payload of the resource it authorizes access to."),
+    EntityType.DECISION: EntityTypeDefinition(
+        type=EntityType.DECISION,
+        since_version="1.3.0",
+        description="An administrative decision (approve/narrow/deny/revoke/expire) on an access request or "
+                     "grant, metadata-only."),
 }
 
 
@@ -107,24 +149,27 @@ RELATIONSHIPS: dict[RelationType, RelationshipDefinition] = {
         since_version="1.0.0",
         description="Source requires target to function; a declared or observed structural dependency.",
         allowed_source_types=_all(EntityType.SERVICE, EntityType.SYSTEM, EntityType.REPOSITORY,
-                                   EntityType.FILE, EntityType.TASK),
+                                   EntityType.FILE, EntityType.TASK, EntityType.PACKAGE),
         allowed_target_types=_all(EntityType.SERVICE, EntityType.SYSTEM, EntityType.REPOSITORY,
-                                   EntityType.FILE, EntityType.TASK)),
+                                   EntityType.FILE, EntityType.TASK, EntityType.PACKAGE)),
     RelationType.PART_OF: RelationshipDefinition(
         type=RelationType.PART_OF,
         since_version="1.0.0",
         description="Source is a structural component of target "
-                     "(1.2.0: also covers a child document nested under a parent document).",
+                     "(1.2.0: also covers a child document nested under a parent document; "
+                     "1.3.0: also covers a repository that builds a service, and a service owned by a project).",
         allowed_source_types=_all(EntityType.FILE, EntityType.SERVICE, EntityType.TASK,
                                    EntityType.TEAM, EntityType.REPOSITORY, EntityType.DOCUMENT),
         allowed_target_types=_all(EntityType.REPOSITORY, EntityType.SYSTEM, EntityType.TASK,
-                                   EntityType.TEAM, EntityType.DOCUMENT)),
+                                   EntityType.TEAM, EntityType.DOCUMENT, EntityType.SERVICE,
+                                   EntityType.PROJECT)),
     RelationType.OWNS: RelationshipDefinition(
         type=RelationType.OWNS,
         since_version="1.0.0",
         description="Source holds formal, source-asserted ownership of target "
-                     "(never inferred from contribution alone; see R05).",
-        allowed_source_types=_all(EntityType.PERSON, EntityType.TEAM),
+                     "(never inferred from contribution alone; see R05; 1.3.0: also covers project-level "
+                     "service ownership).",
+        allowed_source_types=_all(EntityType.PERSON, EntityType.TEAM, EntityType.PROJECT),
         allowed_target_types=_all(EntityType.SERVICE, EntityType.SYSTEM, EntityType.REPOSITORY,
                                    EntityType.DOCUMENT),
         disallowed_origins=frozenset({AssertionOrigin.HYPOTHETICAL, AssertionOrigin.INFERRED})),
@@ -132,17 +177,22 @@ RELATIONSHIPS: dict[RelationType, RelationshipDefinition] = {
         type=RelationType.AUTHORED,
         since_version="1.0.0",
         description="Source person created target "
-                     "(1.1.0: also covers a tracker issue's reporter, who authored the issue record).",
+                     "(1.1.0: also covers a tracker issue's reporter, who authored the issue record; "
+                     "1.4.0: also covers a repository commit's author).",
         allowed_source_types=_all(EntityType.PERSON),
         allowed_target_types=_all(EntityType.PULL_REQUEST, EntityType.DOCUMENT, EntityType.FILE,
-                                   EntityType.TASK)),
+                                   EntityType.TASK, EntityType.COMMIT)),
     RelationType.REFERENCES: RelationshipDefinition(
         type=RelationType.REFERENCES,
         since_version="1.0.0",
-        description="Source cites or links to target without asserting structural dependency.",
+        description="Source cites or links to target without asserting structural dependency "
+                     "(1.5.0: also covers a pull request's own declared affected-service/relevant-contract "
+                     "claims — a source-asserted reference, never proof that the PR's change actually alters "
+                     "that service's or contract's behavior).",
         allowed_source_types=_all(EntityType.DOCUMENT, EntityType.TASK, EntityType.PULL_REQUEST),
         allowed_target_types=_all(EntityType.DOCUMENT, EntityType.TASK, EntityType.PULL_REQUEST,
-                                   EntityType.SERVICE, EntityType.SYSTEM, EntityType.FILE)),
+                                   EntityType.SERVICE, EntityType.SYSTEM, EntityType.FILE,
+                                   EntityType.PROJECT, EntityType.CONTRACT)),
     RelationType.MODIFIES: RelationshipDefinition(
         type=RelationType.MODIFIES,
         since_version="1.0.0",
@@ -167,9 +217,10 @@ RELATIONSHIPS: dict[RelationType, RelationshipDefinition] = {
     RelationType.BELONGS_TO: RelationshipDefinition(
         type=RelationType.BELONGS_TO,
         since_version="1.0.0",
-        description="Source is a member of, or scoped under, target.",
+        description="Source is a member of, or scoped under, target "
+                     "(1.3.0: also covers an employee's project assignment).",
         allowed_source_types=_all(EntityType.PERSON, EntityType.FILE, EntityType.REPOSITORY),
-        allowed_target_types=_all(EntityType.TEAM, EntityType.SYSTEM)),
+        allowed_target_types=_all(EntityType.TEAM, EntityType.SYSTEM, EntityType.PROJECT)),
     RelationType.AFFECTS: RelationshipDefinition(
         type=RelationType.AFFECTS,
         since_version="1.0.0",
@@ -186,9 +237,11 @@ RELATIONSHIPS: dict[RelationType, RelationshipDefinition] = {
         type=RelationType.REVIEWED,
         since_version="1.1.0",
         description="Source person reviewed target pull request — distinct from authorship and never "
-                     "promoted to ownership (see R05).",
+                     "promoted to ownership (see R05; 1.6.0: also covers a document's recorded approver/"
+                     "reviewer, e.g. an architecture decision's approver_or_reviewer_employee_id — never "
+                     "promoted to formal approval authority beyond what the source explicitly records).",
         allowed_source_types=_all(EntityType.PERSON),
-        allowed_target_types=_all(EntityType.PULL_REQUEST)),
+        allowed_target_types=_all(EntityType.PULL_REQUEST, EntityType.DOCUMENT)),
     RelationType.REPORTED: RelationshipDefinition(
         type=RelationType.REPORTED,
         since_version="1.2.0",
@@ -198,6 +251,77 @@ RELATIONSHIPS: dict[RelationType, RelationshipDefinition] = {
                      "source's own creator/authorship field supports it).",
         allowed_source_types=_all(EntityType.PERSON),
         allowed_target_types=_all(EntityType.TASK)),
+    RelationType.INCLUDED_IN: RelationshipDefinition(
+        type=RelationType.INCLUDED_IN,
+        since_version="1.3.0",
+        description="Source commit is included in target pull request.",
+        allowed_source_types=_all(EntityType.COMMIT),
+        allowed_target_types=_all(EntityType.PULL_REQUEST)),
+    RelationType.TRIGGERED: RelationshipDefinition(
+        type=RelationType.TRIGGERED,
+        since_version="1.3.0",
+        description="Source commit triggered target build execution.",
+        allowed_source_types=_all(EntityType.COMMIT),
+        allowed_target_types=_all(EntityType.BUILD)),
+    RelationType.PRODUCED: RelationshipDefinition(
+        type=RelationType.PRODUCED,
+        since_version="1.3.0",
+        description="Source build execution produced target release artifact.",
+        allowed_source_types=_all(EntityType.BUILD),
+        allowed_target_types=_all(EntityType.ARTIFACT)),
+    RelationType.DEPLOYED_AS: RelationshipDefinition(
+        type=RelationType.DEPLOYED_AS,
+        since_version="1.3.0",
+        description="Source release artifact was deployed as target recorded deployment.",
+        allowed_source_types=_all(EntityType.ARTIFACT),
+        allowed_target_types=_all(EntityType.DEPLOYMENT)),
+    RelationType.PROVIDES: RelationshipDefinition(
+        type=RelationType.PROVIDES,
+        since_version="1.3.0",
+        description="Source service is the declared provider of target interface contract or event "
+                     "(the producer side of a producer/consumer data flow; see also the "
+                     "NEX-DEP-003/NEX-DEP-008 canonical-edge-vs-event-direction distinction, which this "
+                     "relation does not resolve or override).",
+        allowed_source_types=_all(EntityType.SERVICE),
+        allowed_target_types=_all(EntityType.CONTRACT, EntityType.EVENT)),
+    RelationType.CONSUMES: RelationshipDefinition(
+        type=RelationType.CONSUMES,
+        since_version="1.3.0",
+        description="Source service is a known consumer of target interface contract or event "
+                     "(the consumer side of a producer/consumer data flow).",
+        allowed_source_types=_all(EntityType.SERVICE),
+        allowed_target_types=_all(EntityType.CONTRACT, EntityType.EVENT)),
+    RelationType.GRANTS_ACCESS_TO: RelationshipDefinition(
+        type=RelationType.GRANTS_ACCESS_TO,
+        since_version="1.3.0",
+        description="Source access grant authorizes target employee or resource "
+                     "(metadata-only: scope/validity, never the restricted resource's payload; "
+                     "a grant must be source-asserted/observed from an actual governance record, "
+                     "never inferred or hypothetical).",
+        allowed_source_types=_all(EntityType.GRANT),
+        allowed_target_types=_all(EntityType.PERSON, EntityType.SERVICE, EntityType.DOCUMENT,
+                                   EntityType.REPOSITORY, EntityType.SYSTEM),
+        disallowed_origins=frozenset({AssertionOrigin.HYPOTHETICAL, AssertionOrigin.INFERRED})),
+    RelationType.DECIDED: RelationshipDefinition(
+        type=RelationType.DECIDED,
+        since_version="1.3.0",
+        description="Source administrative decision resolved target access grant "
+                     "(approval is not evidence of execution; a pending request grants nothing; see Stage 7D "
+                     "governance conventions). A decision must be source-asserted/observed from an actual "
+                     "administrative audit record, never inferred or hypothetical.",
+        allowed_source_types=_all(EntityType.DECISION),
+        allowed_target_types=_all(EntityType.GRANT),
+        disallowed_origins=frozenset({AssertionOrigin.HYPOTHETICAL, AssertionOrigin.INFERRED})),
+    RelationType.SUPERSEDES: RelationshipDefinition(
+        type=RelationType.SUPERSEDES,
+        since_version="1.6.0",
+        description="Source decision document formally, explicitly replaces target decision document (ND-12C, "
+                     "E14 architecture decision genealogy). A declared, source-asserted (or directly observed) "
+                     "genealogy link only -- never inferred from chronological ordering, descriptive/topical "
+                     "similarity, or a later decision merely discussing an earlier one.",
+        allowed_source_types=_all(EntityType.DOCUMENT),
+        allowed_target_types=_all(EntityType.DOCUMENT),
+        disallowed_origins=frozenset({AssertionOrigin.HYPOTHETICAL, AssertionOrigin.INFERRED})),
 }
 
 assert set(RELATIONSHIPS) == set(RelationType), "Every RelationType must have a registry definition"
