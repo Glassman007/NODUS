@@ -17,6 +17,7 @@ from neo4j import GraphDatabase
 
 from backend.app.main import app
 from backend.app.config import Settings
+from backend.app.graph import ontology
 from backend.app.graph.driver import Neo4jStore
 
 
@@ -67,7 +68,7 @@ def isolated_neo4j():
                         "-v", f"{volume}:/data", "neo4j:5.26.32-community"],
                        check=True, stdout=subprocess.DEVNULL)
         driver = GraphDatabase.driver(uri, auth=("neo4j", password))
-        for _ in range(60):
+        for _ in range(180):  # bounded retries: generous for a loaded Docker daemon
             try:
                 driver.verify_connectivity()
                 break
@@ -301,6 +302,215 @@ def test_query_timeout(graph):
             ).single()["n"])
     finally:
         store.close()
+
+
+def test_ontology_rejects_invalid_relationship_endpoints(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    task, person = _name(), _name()
+    invalid = {"source_id": "one", "record_id": _name(), "title": "Bad edge",
+        "entities": [{"external_id": task, "type": "TASK", "name": "Task"},
+                     {"external_id": person, "type": "PERSON", "name": "Person"}],
+        "relationships": [{"source_external_id": person, "target_external_id": task,
+                            "type": "ASSIGNED_TO"}]}
+    rejected = call(client, "writer", "POST", base + "/records", json=invalid)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "INVALID_REQUEST"
+    valid = dict(invalid, relationships=[{"source_external_id": task, "target_external_id": person,
+                                          "type": "ASSIGNED_TO"}])
+    assert call(client, "writer", "POST", base + "/records", json=valid).status_code == 200
+    result = call(client, "writer", "GET", base + f"/entities/one::{task}/neighborhood").json()
+    assert result["relationships"][0]["ontology_version"] == ontology.ONTOLOGY_VERSION
+
+
+def test_hypothetical_relationship_never_enters_the_factual_graph(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    hub, leaf = _name(), _name()
+    payload = {"source_id": "one", "record_id": _name(), "title": "Hypothetical",
+        "entities": [{"external_id": hub, "type": "SERVICE", "name": "Hub"},
+                     {"external_id": leaf, "type": "SERVICE", "name": "Leaf"}],
+        "relationships": [{"source_external_id": leaf, "target_external_id": hub,
+                            "type": "DEPENDS_ON", "origin": "hypothetical"}]}
+    rejected = call(client, "writer", "POST", base + "/records", json=payload)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "INVALID_REQUEST"
+    assert call(client, "writer", "GET", base + f"/entities/one::{hub}").status_code == 404
+
+
+def test_inferred_origin_requires_rule_version_and_cannot_assert_ownership(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    person, service = _name(), _name()
+    entities = [{"external_id": person, "type": "PERSON", "name": "P"},
+                {"external_id": service, "type": "SERVICE", "name": "S"}]
+
+    missing_version = {"source_id": "one", "record_id": _name(), "title": "No version",
+        "entities": entities, "relationships": [
+            {"source_external_id": person, "target_external_id": service,
+             "type": "DEPENDS_ON", "origin": "inferred"}]}
+    assert call(client, "writer", "POST", base + "/records", json=missing_version).status_code == 422
+
+    inferred_ownership = {"source_id": "one", "record_id": _name(), "title": "Inferred ownership",
+        "entities": entities, "relationships": [
+            {"source_external_id": person, "target_external_id": service, "type": "OWNS",
+             "origin": "inferred", "derivation_rule_version": "rule:v1"}]}
+    rejected = call(client, "writer", "POST", base + "/records", json=inferred_ownership)
+    assert rejected.status_code == 422
+    assert "does not permit an origin" in rejected.json()["error"]["message"]
+
+    inferred_dependency = {"source_id": "one", "record_id": _name(), "title": "Inferred dependency",
+        "entities": [{"external_id": person, "type": "PERSON", "name": "P"},
+                     {"external_id": service, "type": "SERVICE", "name": "S2"}],
+        "relationships": [{"source_external_id": service, "target_external_id": service,
+                            "type": "RELATED_TO", "origin": "inferred",
+                            "derivation_rule_version": "rule:v1"}]}
+    assert call(client, "writer", "POST", base + "/records", json=inferred_dependency).status_code == 200
+    result = call(client, "writer", "GET", base + f"/entities/one::{service}/neighborhood").json()
+    stored = result["relationships"][0]
+    assert stored["origin"] == "inferred" and stored["derivation_rule_version"] == "rule:v1"
+
+
+def test_multiple_evidence_records_and_source_specific_withdrawal(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    hub_canonical, leaf_canonical = f"service:{_name()}", f"service:{_name()}"
+    hub_ext, leaf_ext = _name(), _name()
+    first_record, second_record = _name(), _name()
+
+    def entities_for(source_id: str) -> list[dict]:
+        return [{"external_id": hub_ext, "canonical_id": hub_canonical, "type": "SERVICE", "name": "Hub"},
+                {"external_id": leaf_ext, "canonical_id": leaf_canonical, "type": "SERVICE", "name": "Leaf"}]
+
+    relation = [{"source_external_id": leaf_ext, "target_external_id": hub_ext, "type": "DEPENDS_ON"}]
+    first = {"source_id": "one", "record_id": first_record, "title": "Evidence one",
+             "entities": entities_for("one"), "relationships": relation}
+    second = {"source_id": "two", "record_id": second_record, "title": "Evidence two",
+              "entities": entities_for("two"), "relationships": relation}
+    assert call(client, "writer", "POST", base + "/records", json=first).status_code == 200
+    assert call(client, "writer", "POST", base + "/records", json=second).status_code == 200
+    neighborhood = call(client, "writer", "GET", base + f"/entities/{leaf_canonical}/neighborhood").json()
+    depends_on_edges = [edge for edge in neighborhood["relationships"] if edge["type"] == "DEPENDS_ON"]
+    assert len(depends_on_edges) == 2
+    assert {edge["record_id"] for edge in depends_on_edges} == {first_record, second_record}
+
+    assert call(client, "writer", "DELETE", base + f"/records/two/{second_record}").status_code == 200
+    after = call(client, "writer", "GET", base + f"/entities/{leaf_canonical}/neighborhood").json()
+    remaining = [edge for edge in after["relationships"] if edge["type"] == "DEPENDS_ON"]
+    assert len(remaining) == 1 and remaining[0]["record_id"] == first_record
+
+
+def test_graph_revision_advances_only_on_real_mutations(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    before = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    entity_id, record_id = _name(), _name()
+    payload = record("one", record_id, entity_id, "Revisioned")
+
+    first = call(client, "writer", "POST", base + "/records", json=payload)
+    assert first.status_code == 200 and first.json()["changed"] is True
+    after_create = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    assert after_create == before + 1
+    assert first.json()["graph_revision"] == after_create
+
+    replay = call(client, "writer", "POST", base + "/records", json=payload)
+    assert replay.status_code == 200 and replay.json()["changed"] is False
+    assert call(client, "writer", "GET", base + "/graph-revision").json()["revision"] == after_create
+
+    payload["entities"][0]["name"] = "Revisioned again"
+    changed = call(client, "writer", "POST", base + "/records", json=payload)
+    assert changed.status_code == 200 and changed.json()["changed"] is True
+    after_change = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    assert after_change == after_create + 1
+
+    retracted = call(client, "writer", "DELETE", base + f"/records/one/{record_id}")
+    assert retracted.status_code == 200
+    after_retract = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    assert after_retract == after_change + 1
+
+    repeat_retract = call(client, "writer", "DELETE", base + f"/records/one/{record_id}")
+    assert repeat_retract.status_code == 200
+    assert call(client, "writer", "GET", base + "/graph-revision").json()["revision"] == after_retract
+
+
+def test_concurrent_identical_replays_advance_revision_exactly_once(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    before = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    payload = record("one", _name(), _name(), "Concurrent revision")
+
+    def post(_):
+        return call(client, "writer", "POST", base + "/records", json=payload).json()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(post, range(8)))
+    assert sum(1 for item in results if item["changed"]) == 1
+    after = call(client, "writer", "GET", base + "/graph-revision").json()["revision"]
+    assert after == before + 1
+
+
+def test_restricted_evidence_does_not_leak_through_shared_entity_traversal(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    hub_canonical = f"service:{_name()}"
+    hub_ext, public_leaf, secret_leaf = _name(), _name(), _name()
+    public_rec = {"source_id": "one", "record_id": _name(), "title": "Public edge", "acl_subjects": [],
+        "entities": [{"external_id": hub_ext, "canonical_id": hub_canonical, "type": "SERVICE", "name": "Hub"},
+                     {"external_id": public_leaf, "type": "SERVICE", "name": "Public leaf"}],
+        "relationships": [{"source_external_id": hub_ext, "target_external_id": public_leaf, "type": "DEPENDS_ON"}]}
+    secret_rec = {"source_id": "two", "record_id": _name(), "title": "Secret edge", "acl_subjects": ["writer"],
+        "entities": [{"external_id": hub_ext, "canonical_id": hub_canonical, "type": "SERVICE", "name": "Hub"},
+                     {"external_id": secret_leaf, "type": "SERVICE", "name": "Secret leaf"}],
+        "relationships": [{"source_external_id": hub_ext, "target_external_id": secret_leaf, "type": "DEPENDS_ON"}]}
+    assert call(client, "writer", "POST", base + "/records", json=public_rec).status_code == 200
+    assert call(client, "writer", "POST", base + "/records", json=secret_rec).status_code == 200
+
+    reader_view = call(client, "reader", "GET", base + f"/entities/{hub_canonical}/neighborhood").json()
+    reader_leaves = {edge["target_id"] for edge in reader_view["relationships"]}
+    assert reader_leaves == {f"one::{public_leaf}"}
+    assert reader_view["truncated"] is False
+
+    writer_view = call(client, "writer", "GET", base + f"/entities/{hub_canonical}/neighborhood").json()
+    writer_leaves = {edge["target_id"] for edge in writer_view["relationships"]}
+    assert writer_leaves == {f"one::{public_leaf}", f"two::{secret_leaf}"}
+
+    assert call(client, "reader", "GET", base + f"/entities/two::{secret_leaf}").status_code == 404
+    hidden_path = call(client, "reader", "GET", base + "/paths",
+                       params={"source_id": hub_canonical, "target_id": f"two::{secret_leaf}"})
+    assert hidden_path.status_code == 404
+    visible_path = call(client, "writer", "GET", base + "/paths",
+                        params={"source_id": hub_canonical, "target_id": f"two::{secret_leaf}"})
+    assert visible_path.status_code == 200 and len(visible_path.json()["paths"]) == 1
+
+
+def test_invalid_and_missing_tokens_are_rejected(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    assert client.get(base + "/search", params={"q": "x"}).status_code == 401
+    assert call(client, "not-a-real-token", "GET", base + "/search", params={"q": "x"}).status_code == 401
+    malformed = client.get(base + "/search", params={"q": "x"}, headers={"Authorization": "Basic abc"})
+    assert malformed.status_code == 401
+
+
+def test_cycle_handling_in_bounded_paths(graph):
+    client, workspace, _ = graph
+    base = f"/api/v1/workspaces/{workspace}"
+    a, b, c = _name(), _name(), _name()
+    payload = {"source_id": "one", "record_id": _name(), "title": "Cycle",
+        "entities": [{"external_id": x, "type": "SERVICE", "name": x} for x in (a, b, c)],
+        "relationships": [
+            {"source_external_id": a, "target_external_id": b, "type": "DEPENDS_ON"},
+            {"source_external_id": b, "target_external_id": c, "type": "DEPENDS_ON"},
+            {"source_external_id": c, "target_external_id": a, "type": "DEPENDS_ON"},
+        ]}
+    assert call(client, "writer", "POST", base + "/records", json=payload).status_code == 200
+    result = call(client, "writer", "GET", base + "/paths",
+                  params={"source_id": f"one::{a}", "target_id": f"one::{c}", "max_depth": 4})
+    assert result.status_code == 200
+    assert result.json()["paths"]
+    for path in result.json()["paths"]:
+        ids = [node["id"] for node in path["nodes"]]
+        assert len(ids) == len(set(ids))
 
 
 def test_partial_import_recovery_after_write_failure(graph, monkeypatch):

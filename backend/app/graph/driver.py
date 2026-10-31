@@ -12,6 +12,7 @@ SCHEMA = (
     "CREATE INDEX entity_scope_type IF NOT EXISTS FOR (n:Entity) ON (n.tenant_id, n.workspace_id, n.type)",
     "CREATE INDEX source_scope_id IF NOT EXISTS FOR (n:SourceRecord) ON (n.tenant_id, n.workspace_id, n.source_id)",
     "CREATE CONSTRAINT assertion_key IF NOT EXISTS FOR ()-[r:ASSERTS]-() REQUIRE r.key IS UNIQUE",
+    "CREATE CONSTRAINT graph_revision_key IF NOT EXISTS FOR (n:GraphRevision) REQUIRE n.key IS UNIQUE",
 ) + tuple(
     f"CREATE CONSTRAINT fact_{kind.value.lower()}_key IF NOT EXISTS FOR ()-[r:{kind.value}]-() REQUIRE r.key IS UNIQUE"
     for kind in RelationType

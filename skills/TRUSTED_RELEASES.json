@@ -1,0 +1,11 @@
+{
+  "graph-trace": {
+    "1.0.0": "06252b226c05e4332dcd3af3eb887a8ed8229a32d130e0ef00e9878dd2593de0"
+  },
+  "investigate-conflict": {
+    "1.0.0": "fe60e78dd6edfb299aa5ea719a85ab4fb919676a250c65db84246f8802b4049a"
+  },
+  "verify-evidence": {
+    "1.0.0": "da36511866f01c97647fde482e376d1107e279d90c61afd4cc818021c0955877"
+  }
+}

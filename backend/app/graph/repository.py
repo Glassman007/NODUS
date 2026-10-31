@@ -6,8 +6,10 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.app.graph import ontology
+from backend.app.graph.authority import AuthorityRule, resolve_entity_field_authority
 from backend.app.graph.driver import Neo4jStore
-from backend.app.graph.models import Entity, Evidence, GraphPage, Relationship, SourceRecordInput
+from backend.app.graph.models import EntityType, Entity, Evidence, GraphPage, Relationship, SourceRecordInput
 
 
 def scoped_key(*parts: str) -> str:
@@ -18,11 +20,34 @@ def iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat() if value else None
 
 
+def _record_fingerprint(record: SourceRecordInput) -> str:
+    """Content hash of a source record's meaning, ignoring ingestion wall-clock
+    time. Used to tell a true content change apart from a byte-identical
+    replay, so idempotent replays never advance the graph revision."""
+    entities_repr = tuple(sorted(
+        (entity.external_id, entity.canonical_id or "", entity.type.value, entity.name,
+         entity.description, iso(entity.valid_from) or "", iso(entity.valid_to) or "")
+        for entity in record.entities
+    ))
+    relationships_repr = tuple(sorted(
+        (rel.source_external_id, rel.target_external_id, rel.type.value, rel.origin.value,
+         rel.derivation_rule_version or "", iso(rel.observed_at) or "",
+         iso(rel.valid_from) or "", iso(rel.valid_to) or "")
+        for rel in record.relationships
+    ))
+    return scoped_key(
+        record.title, record.uri or "", repr(sorted(record.acl_subjects)),
+        iso(record.observed_at) or "", record.revision or "",
+        repr(entities_repr), repr(relationships_repr),
+    )
+
+
 class GraphRepository:
     """All graph reads and writes require one authorized tenant/workspace context."""
 
     def __init__(self, store: Neo4jStore, tenant_id: str, workspace_id: str,
-                 subject: str, allow_all: bool = False, can_evidence: bool = False):
+                 subject: str, allow_all: bool = False, can_evidence: bool = False,
+                 authority_rules: tuple[AuthorityRule, ...] = ()):
         if not tenant_id or not workspace_id or not subject:
             raise ValueError("Tenant, workspace and subject are required")
         self.store = store
@@ -31,14 +56,37 @@ class GraphRepository:
         self.subject = subject
         self.allow_all = allow_all
         self.can_evidence = can_evidence or allow_all
+        self.authority_rules = authority_rules
 
     def _params(self) -> dict[str, Any]:
         return dict(tenant=self.tenant_id, workspace=self.workspace_id,
                     subject=self.subject, allow_all=self.allow_all,
                     as_of=iso(datetime.now(timezone.utc)))
 
-    @staticmethod
-    def _resolve(entity_id: str, assertions: list[dict[str, Any]], active: bool = True) -> Entity:
+    def _revision_key(self) -> str:
+        return scoped_key(self.tenant_id, self.workspace_id, "graph_revision")
+
+    def _current_revision_in_tx(self, tx) -> int:
+        row = tx.run("MATCH (g:GraphRevision {key:$key}) RETURN g.revision AS revision",
+                      key=self._revision_key()).single()
+        return row["revision"] if row else 0
+
+    def _bump_revision_in_tx(self, tx) -> int:
+        """Advance the workspace-scoped graph revision. Only ever called from
+        within a write transaction that also performs the factual mutation, so
+        the revision bump commits atomically with that mutation (same tx)."""
+        row = tx.run("""
+            MERGE (g:GraphRevision {key:$key})
+            ON CREATE SET g.tenant_id=$tenant, g.workspace_id=$workspace, g.revision=0
+            SET g.revision = g.revision + 1
+            RETURN g.revision AS revision
+            """, key=self._revision_key(), tenant=self.tenant_id, workspace=self.workspace_id).single()
+        return row["revision"]
+
+    def graph_revision(self) -> int:
+        return self.store.read(self._current_revision_in_tx)
+
+    def _resolve(self, entity_id: str, assertions: list[dict[str, Any]], active: bool = True) -> Entity:
         values: dict[str, Any] = {}
         conflicts: dict[str, list[str]] = {}
         for field in ("type", "name", "description"):
@@ -50,8 +98,24 @@ class GraphRepository:
                 conflicts[field] = choices
             else:
                 values[field] = None
+        authority: dict[str, dict] = {}
+        if conflicts:
+            # Authority never resolves a "type" conflict against itself — if
+            # the type is contested, which type's rules would even apply is
+            # itself undecided, so every field falls back to "no_rule" rather
+            # than guessing a type to key rules off of.
+            resolved_type = EntityType(values["type"]) if values.get("type") else None
+            for field in conflicts:
+                candidate_sources = frozenset(
+                    claim["source_id"] for claim in assertions if claim.get(field) is not None
+                    and claim["source_id"] is not None)
+                verdict = resolve_entity_field_authority(
+                    tenant_id=self.tenant_id, workspace_id=self.workspace_id, entity_type=resolved_type,
+                    candidate_source_ids=candidate_sources, rules=self.authority_rules)
+                authority[field] = verdict.model_dump(mode="json")
         return Entity(id=entity_id, type=values["type"], name=values["name"],
-                      description=values["description"], active=active, conflicts=conflicts)
+                      description=values["description"], active=active, conflicts=conflicts,
+                      authority=authority)
 
     def _relationship(self, rel, source_id: str, target_id: str) -> Relationship:
         return Relationship(
@@ -60,13 +124,16 @@ class GraphRepository:
             valid_from=rel.get("valid_from"), valid_to=rel.get("valid_to"),
             source_id_ref=rel.get("source_id") if self.can_evidence else None,
             record_id=rel.get("record_id") if self.can_evidence else None,
+            ontology_version=rel.get("ontology_version"),
+            origin=rel.get("origin"), derivation_rule_version=rel.get("derivation_rule_version"),
+            ingested_at=rel.get("ingested_at"),
         )
 
     @staticmethod
     def _claim(row) -> dict[str, Any]:
         assertion = row["a"]
         return dict(type=assertion.get("type"), name=assertion.get("name"),
-                    description=assertion.get("description"))
+                    description=assertion.get("description"), source_id=row["source_id"])
 
     def _entity_in_tx(self, tx, entity_id: str, history: bool = False) -> Entity | None:
         key = scoped_key(self.tenant_id, self.workspace_id, entity_id)
@@ -79,7 +146,7 @@ class GraphRepository:
               AND s.tenant_id=$tenant AND s.workspace_id=$workspace
               AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
               AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-            RETURN e.public_id AS id, a, s.active AS source_active
+            RETURN e.public_id AS id, a, s.active AS source_active, s.source_id AS source_id
             """, key=key, history=history, **self._params()))
         if not rows:
             return None
@@ -118,7 +185,7 @@ class GraphRepository:
                     "source_id": s["source_id"], "record_id": s["record_id"],
                     "type": a.get("type"), "name": a.get("name"),
                     "description": a.get("description"), "current": current,
-                    "observed_at": a.get("observed_at"),
+                    "observed_at": a.get("observed_at"), "ingested_at": a.get("ingested_at"),
                     "valid_from": a.get("valid_from"), "valid_to": a.get("valid_to"),
                 })
             return {"items": items, "truncated": len(rows) > limit}
@@ -133,8 +200,14 @@ class GraphRepository:
             raise ValueError("Relationship endpoints must be in the same source record")
         if len({(rel.source_external_id, rel.target_external_id, rel.type) for rel in record.relationships}) != len(record.relationships):
             raise ValueError("Duplicate relationship in source record")
+        entity_types = {entity.external_id: entity.type for entity in record.entities}
+        for rel in record.relationships:
+            ontology.validate_relationship(
+                rel.type, entity_types[rel.source_external_id], entity_types[rel.target_external_id],
+                rel.origin)
         tenant, workspace = self.tenant_id, self.workspace_id
         record_key = scoped_key(tenant, workspace, record.source_id, record.record_id)
+        content_hash = _record_fingerprint(record)
         entity_keys = {
             entity.external_id: scoped_key(
                 tenant, workspace, entity.canonical_id or f"{record.source_id}::{entity.external_id}"
@@ -146,16 +219,30 @@ class GraphRepository:
         }
 
         def work(tx):
-            tx.run("""
+            ingested_at = iso(datetime.now(timezone.utc))
+            # MERGE acquires the node's write lock for the rest of this transaction;
+            # the WITH captures the pre-write active/content_hash atomically under
+            # that same lock, so a concurrent identical replay can never race past
+            # this check before seeing the committed result of the first writer.
+            previous = tx.run("""
                 MERGE (s:SourceRecord {key:$key})
+                ON CREATE SET s.content_hash=''
+                WITH s, s.active AS was_active, s.content_hash AS old_hash
                 SET s.tenant_id=$tenant, s.workspace_id=$workspace, s.source_id=$source_id,
                     s.record_id=$record_id, s.title=$title, s.uri=$uri,
                     s.acl_subjects=$acl, s.observed_at=$observed_at,
-                    s.revision=$revision, s.active=true
+                    s.revision=$revision, s.active=true, s.content_hash=$content_hash,
+                    s.ingested_at=$ingested_at
+                RETURN was_active, old_hash
                 """, key=record_key, tenant=tenant, workspace=workspace,
                 source_id=record.source_id, record_id=record.record_id, title=record.title,
                 uri=record.uri, acl=record.acl_subjects, observed_at=iso(record.observed_at),
-                revision=record.revision).consume()
+                revision=record.revision, content_hash=content_hash, ingested_at=ingested_at).single()
+            unchanged = bool(previous["was_active"] and previous["old_hash"] == content_hash)
+            if unchanged:
+                return {"source_id": record.source_id, "record_id": record.record_id,
+                        "entities": len(record.entities), "relationships": len(record.relationships),
+                        "graph_revision": self._current_revision_in_tx(tx), "changed": False}
             tx.run("""
                 MATCH (s:SourceRecord {key:$key})-[a:ASSERTS]->(:Entity)
                 SET a.active=false
@@ -179,13 +266,13 @@ class GraphRepository:
                     MERGE (s)-[a:ASSERTS {key:$assertion_key}]->(e)
                     SET a.active=true, a.type=$type, a.name=$name,
                         a.description=$description, a.observed_at=$observed_at,
-                        a.acl_subjects=$acl,
+                        a.acl_subjects=$acl, a.ingested_at=$ingested_at,
                         a.valid_from=$valid_from, a.valid_to=$valid_to
                     """, record_key=record_key, entity_key=entity_key,
                     assertion_key=assertion_key, tenant=tenant, workspace=workspace,
                     public_id=public_ids[entity.external_id], type=entity.type.value,
                     name=entity.name, description=entity.description,
-                    acl=record.acl_subjects,
+                    acl=record.acl_subjects, ingested_at=ingested_at,
                     observed_at=iso(record.observed_at),
                     valid_from=iso(entity.valid_from), valid_to=iso(entity.valid_to)).consume()
             for rel in record.relationships:
@@ -204,15 +291,21 @@ class GraphRepository:
                     SET r.tenant_id=$tenant, r.workspace_id=$workspace, r.record_key=$record_key,
                         r.source_id=$source_id, r.record_id=$record_id, r.active=true,
                         r.observed_at=$observed_at, r.valid_from=$valid_from, r.valid_to=$valid_to,
-                        r.acl_subjects=$acl
+                        r.acl_subjects=$acl, r.ontology_version=$ontology_version,
+                        r.origin=$origin, r.derivation_rule_version=$derivation_rule_version,
+                        r.ingested_at=$ingested_at
                     """, left=left, right=right, tenant=tenant, workspace=workspace,
                     relation_key=relation_key, record_key=record_key,
                     source_id=record.source_id, record_id=record.record_id,
-                    acl=record.acl_subjects,
+                    acl=record.acl_subjects, ontology_version=ontology.ONTOLOGY_VERSION,
+                    origin=rel.origin.value, derivation_rule_version=rel.derivation_rule_version,
+                    ingested_at=ingested_at,
                     observed_at=iso(rel.observed_at or record.observed_at),
                     valid_from=iso(rel.valid_from), valid_to=iso(rel.valid_to)).consume()
+            revision = self._bump_revision_in_tx(tx)
             return {"source_id": record.source_id, "record_id": record.record_id,
-                    "entities": len(record.entities), "relationships": len(record.relationships)}
+                    "entities": len(record.entities), "relationships": len(record.relationships),
+                    "graph_revision": revision, "changed": True}
 
         return self.store.write(work)
 
@@ -220,12 +313,19 @@ class GraphRepository:
         key = scoped_key(self.tenant_id, self.workspace_id, source_id, record_id)
 
         def work(tx):
+            # WITH captures the pre-write active flag under the same lock MATCH+SET
+            # holds for the rest of this transaction, so a repeat retraction of an
+            # already-inactive record is detected without a race.
             found = tx.run("""
                 MATCH (s:SourceRecord {key:$key, tenant_id:$tenant, workspace_id:$workspace})
-                SET s.active=false RETURN s.key AS key
+                WITH s, s.active AS was_active
+                SET s.active=false
+                RETURN s.key AS key, was_active
                 """, key=key, **self._params()).single()
             if not found:
                 return False
+            if not found["was_active"]:
+                return True
             tx.run("MATCH (s:SourceRecord {key:$key})-[a:ASSERTS]->() SET a.active=false",
                    key=key).consume()
             tx.run("""
@@ -233,6 +333,7 @@ class GraphRepository:
                 WHERE r.record_key=$key AND r.tenant_id=$tenant AND r.workspace_id=$workspace
                 SET r.active=false
                 """, key=key, **self._params()).consume()
+            self._bump_revision_in_tx(tx)
             return True
 
         return self.store.write(work)
@@ -251,7 +352,7 @@ class GraphRepository:
                   AND (a.valid_to IS NULL OR a.valid_to > $as_of)
                   AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-                WITH e, collect({type:a.type, name:a.name, description:a.description}) AS claims
+                WITH e, collect({type:a.type, name:a.name, description:a.description, source_id:s.source_id}) AS claims
                 WHERE toLower(e.public_id) CONTAINS $needle
                    OR any(claim IN claims WHERE toLower(claim.name) CONTAINS $needle)
                 RETURN e.public_id AS id, claims

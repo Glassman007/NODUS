@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from backend.app.config import Settings
+from backend.app.graph.authority import AuthorityRule
 from backend.app.graph.driver import Neo4jStore
 from backend.app.graph.models import SourceRecordInput
 from backend.app.graph.repository import GraphRepository
@@ -52,12 +53,25 @@ def require(permission: str):
     return dependency
 
 
+def load_authority_rules() -> tuple[AuthorityRule, ...]:
+    """Deterministic source/scope authority rules (R07), configured the same
+    way as principals: an opaque JSON env var, never a reasoning service.
+    Absent or invalid configuration means no rules apply — every conflict
+    stays unresolved rather than guessed."""
+    try:
+        raw = json.loads(os.getenv("GRAPH_HACKS_AUTHORITY_RULES_JSON", "[]"))
+        return tuple(AuthorityRule(**item) for item in raw)
+    except (ValueError, TypeError):
+        return ()
+
+
 def repository(request: Request, user: Principal, workspace_id: str) -> GraphRepository:
     if workspace_id not in user.workspaces:
         raise HTTPException(404, "Workspace not available")
     return GraphRepository(request.app.state.graph_store, user.tenant_id, workspace_id,
                            user.subject, "ADMIN" in user.permissions,
-                           user.permits("READ_EVIDENCE"))
+                           user.permits("READ_EVIDENCE"),
+                           authority_rules=request.app.state.authority_rules)
 
 
 @asynccontextmanager
@@ -66,6 +80,7 @@ async def lifespan(app: FastAPI):
     try:
         store.start()
         app.state.graph_store = store
+        app.state.authority_rules = load_authority_rules()
         yield
     finally:
         store.close()
@@ -280,6 +295,12 @@ def assertions(workspace_id: str, entity_id: str, request: Request,
     if repo.get_entity_history(entity_id) is None:
         raise HTTPException(404, "Entity not found")
     return repo.assertions(entity_id, limit)
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/graph-revision")
+def graph_revision(workspace_id: str, request: Request,
+                   user: Principal = Depends(require("READ_GRAPH"))):
+    return {"revision": repository(request, user, workspace_id).graph_revision()}
 
 
 @app.get("/api/v1/workspaces/{workspace_id}/sources")

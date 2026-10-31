@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from pydantic import BaseModel, Field, model_validator
 
-from backend.app.graph.models import EntityInput, EntityType, RelationInput, RelationType, SourceRecordInput
+from backend.app.graph.models import (
+    AssertionOrigin, EntityInput, EntityType, RelationInput, RelationType, SourceRecordInput,
+)
 
 
 class LocalEntity(BaseModel):
@@ -23,6 +25,8 @@ class LocalLink(BaseModel):
     observed_at: datetime | None = None
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+    origin: AssertionOrigin = AssertionOrigin.SOURCE_ASSERTED
+    derivation_rule_version: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class LocalRecord(BaseModel):
@@ -73,7 +77,8 @@ def normalize(source_id: str, record: LocalRecord) -> SourceRecordInput:
         relationships=[
             RelationInput(source_external_id=link.from_id, target_external_id=link.to_id,
                           type=link.kind, observed_at=link.observed_at,
-                          valid_from=link.valid_from, valid_to=link.valid_to)
+                          valid_from=link.valid_from, valid_to=link.valid_to,
+                          origin=link.origin, derivation_rule_version=link.derivation_rule_version)
             for link in record.links
         ],
     )

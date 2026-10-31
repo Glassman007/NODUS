@@ -155,6 +155,39 @@ class ProjectionWatermark(Record):
         return event.aggregate_revision > self.revision + 1
 
 
+class BaselineMetrics(Record):
+    """Stage 01 reference measurements for the current Neo4j-only slice.
+
+    Postgres/outbox are contracts only (see StorageAdoptionCriteria); only
+    metrics observable from the live graph API are recorded here.
+    """
+    tenant_id: str = Field(min_length=1)
+    measured_at: datetime
+    ingest_p95_ms: float = Field(ge=0)
+    query_p95_ms: float = Field(ge=0)
+    connector_count: int = Field(ge=0)
+    cross_store_conflicts_observed: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def aware(self):
+        if self.measured_at.tzinfo is None:
+            raise ValueError("Baseline measurement time must have a timezone")
+        return self
+
+
+class StorageAdoptionCriteria(Record):
+    """Explicit gate for moving the Postgres outbox/projector from contract to
+    implementation. Do not build OutboxPort/ProjectorPort adapters until this
+    is satisfied by an observed BaselineMetrics sample.
+    """
+    min_connector_count: int = Field(default=2, ge=1)
+    min_cross_store_conflicts: int = Field(default=1, ge=0)
+
+    def should_adopt(self, metrics: BaselineMetrics) -> bool:
+        return (metrics.connector_count >= self.min_connector_count
+                or metrics.cross_store_conflicts_observed >= self.min_cross_store_conflicts)
+
+
 class GraphPort(Protocol):
     def ingest(self, record: SourceRecordInput) -> dict: ...
 

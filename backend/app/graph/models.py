@@ -31,6 +31,25 @@ class RelationType(StrEnum):
     BELONGS_TO = "BELONGS_TO"
     AFFECTS = "AFFECTS"
     BLOCKS = "BLOCKS"
+    REVIEWED = "REVIEWED"
+    REPORTED = "REPORTED"
+
+
+class AssertionOrigin(StrEnum):
+    """Four distinct relationship-origin semantics (R05).
+
+    ``source_asserted`` is a source system's direct claim (e.g. a declared
+    CODEOWNERS entry); ``observed`` is directly witnessed activity (e.g. a
+    commit author); ``inferred`` is derived by an explicit rule/model and must
+    carry ``derivation_rule_version``; ``hypothetical`` is speculative and is
+    rejected before it ever reaches the factual graph (see
+    ``GraphRepository.ingest``) — it exists only so a future counterfactual
+    overlay (R35) has a name for the state it must stay outside of.
+    """
+    SOURCE_ASSERTED = "source_asserted"
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+    HYPOTHETICAL = "hypothetical"
 
 
 class EntityInput(BaseModel):
@@ -56,11 +75,21 @@ class RelationInput(BaseModel):
     observed_at: datetime | None = None
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+    origin: AssertionOrigin = AssertionOrigin.SOURCE_ASSERTED
+    derivation_rule_version: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def valid_interval(self):
         if self.valid_from and self.valid_to and self.valid_to <= self.valid_from:
             raise ValueError("valid_to must be after valid_from")
+        return self
+
+    @model_validator(mode="after")
+    def valid_origin(self):
+        if self.origin == AssertionOrigin.INFERRED and not self.derivation_rule_version:
+            raise ValueError("An inferred relationship must identify its derivation rule/model version")
+        if self.origin != AssertionOrigin.INFERRED and self.derivation_rule_version:
+            raise ValueError("derivation_rule_version is only meaningful for an inferred relationship")
         return self
 
 
@@ -83,6 +112,10 @@ class Entity(BaseModel):
     description: str | None = None
     active: bool = True
     conflicts: dict[str, list[str]] = Field(default_factory=dict)
+    # Per conflicting field: a structured, inspectable authority verdict (R07)
+    # — "why this claim is or is not authoritative" — never a resolved value;
+    # `conflicts` above remains the complete, unmodified source of truth.
+    authority: dict[str, dict] = Field(default_factory=dict)
 
 
 class Relationship(BaseModel):
@@ -96,6 +129,10 @@ class Relationship(BaseModel):
     valid_to: str | None = None
     source_id_ref: str | None = None
     record_id: str | None = None
+    ontology_version: str | None = None
+    origin: str | None = None
+    derivation_rule_version: str | None = None
+    ingested_at: str | None = None
 
 
 class Evidence(BaseModel):

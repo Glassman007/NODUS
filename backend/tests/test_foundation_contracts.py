@@ -5,8 +5,8 @@ from pydantic import ValidationError
 
 from backend.app.config import Settings
 from backend.app.contracts import (
-    Checkpoint, Completion, ExecutionBudget, Handoff, Identity, OutboxEvent,
-    ProjectionWatermark, TaskState,
+    BaselineMetrics, Checkpoint, Completion, ExecutionBudget, Handoff, Identity,
+    OutboxEvent, ProjectionWatermark, StorageAdoptionCriteria, TaskState,
 )
 from backend.app.security import AuthorizationContext, Permission, Principal, ToolPolicy
 
@@ -104,6 +104,20 @@ def test_event_revision_and_replay_contract():
         OutboxEvent(event_id="", tenant_id="tenant", aggregate_id="task",
                     aggregate_revision=0, event_type="TaskChanged", idempotency_key="",
                     occurred_at=NOW)
+
+
+def test_baseline_metrics_and_storage_adoption_criteria():
+    with pytest.raises(ValidationError):
+        BaselineMetrics(tenant_id="tenant", measured_at=NOW.replace(tzinfo=None),
+                        ingest_p95_ms=10, query_p95_ms=5, connector_count=1,
+                        cross_store_conflicts_observed=0)
+    quiet = BaselineMetrics(tenant_id="tenant", measured_at=NOW, ingest_p95_ms=10,
+                            query_p95_ms=5, connector_count=1, cross_store_conflicts_observed=0)
+    busy = BaselineMetrics(tenant_id="tenant", measured_at=NOW, ingest_p95_ms=10,
+                           query_p95_ms=5, connector_count=2, cross_store_conflicts_observed=0)
+    criteria = StorageAdoptionCriteria()
+    assert not criteria.should_adopt(quiet)
+    assert criteria.should_adopt(busy)
 
 
 def test_config_urls():
