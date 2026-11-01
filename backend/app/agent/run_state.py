@@ -44,6 +44,7 @@ class RunState:
     total_output_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float | None = None
+    model_used: str | None = None
     hard_stopped_reason: str | None = None
 
     tool_calls_made: int = 0
@@ -81,13 +82,16 @@ class RunState:
                    for dep in self.selected_skill_manifest.compatible_tools)
 
     def record_llm_usage(self, *, input_tokens: int | None, output_tokens: int | None,
-                         total_tokens: int | None, estimated_cost_usd: float | None) -> None:
+                         total_tokens: int | None, estimated_cost_usd: float | None,
+                         actual_model: str | None = None) -> None:
         self.llm_calls += 1
         self.total_input_tokens += input_tokens or 0
         self.total_output_tokens += output_tokens or 0
         self.total_tokens += total_tokens or 0
         if estimated_cost_usd is not None:
             self.estimated_cost_usd = (self.estimated_cost_usd or 0.0) + estimated_cost_usd
+        if actual_model:
+            self.model_used = actual_model
 
     def record_tool_result(self, tool_id: str, version: str, result: ToolResult,
                            arguments: dict | None = None) -> None:
@@ -123,6 +127,7 @@ class RunState:
             llm_calls=self.llm_calls, total_input_tokens=self.total_input_tokens,
             total_output_tokens=self.total_output_tokens, total_tokens=self.total_tokens,
             estimated_cost_usd=self.estimated_cost_usd, tool_calls=self.tool_calls_made,
+            model_used=self.model_used,
         )
 
 

@@ -35,11 +35,11 @@ class ApprovedSkill(Record):
 class RuntimeLimits(Record):
     """Small, explicit, configurable defaults — never an unrestricted ADK
     default (``RunConfig.max_llm_calls`` otherwise defaults to 500)."""
-    max_llm_calls: int = Field(default=6, ge=1, le=50)
-    max_tool_calls: int = Field(default=12, ge=1, le=100)
-    max_output_tokens_per_call: int = Field(default=1024, ge=1, le=65_536)
-    max_total_tokens_per_call: int = Field(default=8192, ge=1, le=200_000)
-    overall_timeout_seconds: float = Field(default=90.0, gt=0, le=600)
+    max_llm_calls: int = Field(default=50, ge=1, le=50)
+    max_tool_calls: int = Field(default=100, ge=1, le=100)
+    max_output_tokens_per_call: int = Field(default=65_536, ge=1, le=65_536)
+    max_total_tokens_per_call: int = Field(default=200_000, ge=1, le=200_000)
+    overall_timeout_seconds: float = Field(default=600.0, gt=0, le=600)
     request_budget_key: str | None = Field(default=None, min_length=1)
 
 
@@ -113,6 +113,7 @@ class ModelUsageSummary(Record):
     total_tokens: int = Field(default=0, ge=0)
     estimated_cost_usd: float | None = Field(default=None, ge=0)
     tool_calls: int = Field(default=0, ge=0)
+    model_used: str | None = None
 
 
 class InvestigationResult(Record):
@@ -155,10 +156,49 @@ class InvestigationResult(Record):
 
 
 class SpecialistRole(StrEnum):
-    """ND-13A bounded specialist roles. See ``backend/app/agent/coordinator.py``."""
+    """ND-13A/13B bounded specialist roles. See ``backend/app/agent/coordinator.py``."""
     DISCOVERY = "DISCOVERY"
     IMPACT = "IMPACT"
+    VERIFICATION = "VERIFICATION"
     SYNTHESIS = "SYNTHESIS"
+
+
+class ClaimType(StrEnum):
+    """ND-13B: what kind of statement a ``ClaimVerificationResult`` is
+    checking — preserves the section-4 distinction between an observed fact,
+    a derived potential impact, and (never produced by today's Stage 12
+    tools) a demonstrated technical failure."""
+    ENTITY_ASSERTION = "ENTITY_ASSERTION"
+    DEPENDENCY_PATH = "DEPENDENCY_PATH"
+
+
+class VerificationStatus(StrEnum):
+    """ND-13B claim-verification outcome vocabulary (section 4). Never a
+    numeric confidence score."""
+    SUPPORTED = "SUPPORTED"
+    PARTIALLY_SUPPORTED = "PARTIALLY_SUPPORTED"
+    UNSUPPORTED = "UNSUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+    STALE = "STALE"
+    NOT_CHECKED = "NOT_CHECKED"
+
+
+class ClaimVerificationResult(Record):
+    """One independently-checked claim. Built only from a fresh, independent
+    re-fetch through the existing tool gateway (``backend.app.tools.executor.
+    ToolExecutor``) under the verifier's own freshly-refreshed authorization —
+    never from re-asking the impact specialist's model whether its own
+    answer looks right, and never from trusting a duplicate citation as a
+    second independent confirmation (ND-13B section 5)."""
+    claim_id: str = Field(min_length=1, max_length=500)
+    claim_type: ClaimType
+    claim_summary: str = Field(min_length=1, max_length=1000)
+    status: VerificationStatus
+    supporting_evidence_refs: tuple[str, ...] = ()
+    contradicting_evidence_refs: tuple[str, ...] = ()
+    graph_revision: int | None = None
+    explanation: str = Field(default="", max_length=1000)
+    limitations: tuple[str, ...] = ()
 
 
 class CoordinatorBudget(Record):
@@ -193,15 +233,41 @@ class SpecialistResult(Record):
     tool_ids_called: tuple[str, ...] = ()
     llm_calls_made: int = Field(default=0, ge=0)
     skipped_reason: str | None = Field(default=None, max_length=500)
+    claim_verifications: tuple[ClaimVerificationResult, ...] = ()
+    model_used: str | None = None
+    total_input_tokens: int = Field(default=0, ge=0)
+    total_output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    estimated_cost_usd: float | None = Field(default=None, ge=0)
 
 
 class CoordinatedInvestigationResult(Record):
-    """ND-13A's coordinated-investigation result: what a discovery + impact +
-    synthesis pass over the existing infrastructure actually produced.
-    ``verification_status`` is always ``PENDING_INDEPENDENT_VERIFICATION``
-    here — ND-13A performs no independent verification of synthesized
-    conclusions; that is ND-13B's job (see module docstring of
-    ``backend/app/agent/coordinator.py``)."""
+    """ND-13A/13B's coordinated-investigation result: what a discovery +
+    impact + verification + synthesis pass over the existing infrastructure
+    actually produced.
+
+    ``verification_status`` (ND-13C section 1 fix — see
+    ``backend.app.agent.coordinator.verification_status_for``) is one of:
+
+    * ``"PENDING_INDEPENDENT_VERIFICATION"`` — verification never ran, or
+      produced no claims at all.
+    * ``"PARTIALLY_VERIFIED"`` — verification ran but did not reach a full,
+      claim-level conclusion: some claim is ``NOT_CHECKED`` (budget/access)
+      or ``STALE``, or every claim produced was only the weaker
+      entity-existence-level check (no actual relationship/path claim was
+      independently re-derived — the case for the three Stage 12 skills
+      that carry no multi-hop finding shape today).
+    * ``"INDEPENDENTLY_VERIFIED"`` — every claim reached a definitive,
+      current outcome (``SUPPORTED``/``UNSUPPORTED``/``CONTRADICTED``) and at
+      least one was an actual relationship-level (``DEPENDENCY_PATH``) check,
+      not merely "the entity still exists". A claim coming back
+      ``UNSUPPORTED``/``CONTRADICTED`` does not by itself prevent this value
+      — independent verification succeeded at determining that, which is the
+      point; only an incomplete check (``NOT_CHECKED``/``STALE``) does.
+
+    Section 8's safe-synthesis buckets never promote a derived potential
+    impact into a demonstrated technical failure, and never silently upgrade
+    an unchecked/contradicted/stale claim to supported."""
     run_id: str = Field(min_length=1)
     status: InvestigationStatus
     summary: str = Field(min_length=1, max_length=4000)
@@ -213,6 +279,69 @@ class CoordinatedInvestigationResult(Record):
     source_coverage_limitations: tuple[str, ...] = ()
     specialist_results: tuple[SpecialistResult, ...] = ()
     model_usage: ModelUsageSummary = Field(default_factory=ModelUsageSummary)
+    models_used: tuple[str, ...] = ()
     incomplete_work: tuple[str, ...] = ()
     verification_status: str = "PENDING_INDEPENDENT_VERIFICATION"
+    supported_findings: tuple[str, ...] = ()
+    potential_effects: tuple[str, ...] = ()
+    unverified_findings: tuple[str, ...] = ()
+    contradictions: tuple[str, ...] = ()
+    stale_findings: tuple[str, ...] = ()
     error_message: str | None = Field(default=None, max_length=1000)
+
+
+class FreshnessStatus(StrEnum):
+    """ND-14C: whether a persisted verification result can still be treated as describing the current
+    graph state. Never a numeric confidence score."""
+    CURRENT = "CURRENT"
+    STALE = "STALE"
+    REVERIFICATION_REQUIRED = "REVERIFICATION_REQUIRED"
+    REVERIFIED = "REVERIFIED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class InvestigationHandoffPacket(Record):
+    """ND-14B section 5: a compact, typed snapshot of an investigation's
+    persisted state for a human-to-human handoff. Assembled entirely from
+    already-authorized, already-structured persisted records
+    (``backend.app.agent.persistence.InvestigationStore`` checkpoints) —
+    never from a fresh LLM call, never a raw model conversation or
+    unrestricted source document. See
+    ``backend.app.agent.handoff.build_handoff_packet``, which is the only
+    place this is constructed: it is returned only after confirming every
+    evidence reference below is within the RECIPIENT's own current
+    authorized source scope, never the original investigator's."""
+    run_id: str = Field(min_length=1)
+    objective: str
+    original_creator: str
+    current_owner: str
+    intended_recipient: str | None = None
+    status: str
+
+    completed_phases: tuple[str, ...] = ()
+    current_phase: str | None = None
+    remaining_work: tuple[str, ...] = ()
+    checkpoint_version: int = Field(default=0, ge=0)
+    budget_usage: dict = Field(default_factory=dict)
+
+    entity_ids: tuple[str, ...] = ()
+    evidence_backed_findings: tuple[str, ...] = ()
+    potential_impacts: tuple[str, ...] = ()
+    uncertainties: tuple[str, ...] = ()
+
+    supported_findings: tuple[str, ...] = ()
+    unverified_findings: tuple[str, ...] = ()
+    contradictions: tuple[str, ...] = ()
+    stale_findings: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    graph_revision: int | None = None
+
+    outstanding_tasks: tuple[str, ...] = ()
+    authorization_status: str = "AUTHORIZED"
+    next_continuation_point: str = ""
+    # ND-14C section 6: whether the verification findings above are still current as of generation time
+    # — never silently presented as current when they are not. ``recipient_identity_validated`` is
+    # ``None`` when no authoritative principal registry was available to check against (ND-14C section 8
+    # — an honest "unknown", never treated as "valid").
+    verification_freshness: str = FreshnessStatus.UNAVAILABLE.value
+    recipient_identity_validated: bool | None = None

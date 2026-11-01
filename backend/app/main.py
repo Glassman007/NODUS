@@ -25,6 +25,8 @@ from backend.app.governance.identity import (
     NEXUS_TENANT_ID, authorized_source_ids_for, isolated_demo_mode_enabled,
     nexus_identity_summary, principal_authorizes_action, resolve_demo_principal,
 )
+from backend.app.governance.identity import ROLE_PERMISSIONS
+from backend.app.governance.local_demo_login import demo_user_for_token
 from backend.app.governance.store import GovernanceStore
 from backend.app.graph.authority import AuthorityRule
 from backend.app.graph.driver import Neo4jStore
@@ -59,6 +61,14 @@ def principal_from_token(token: str, governance_store: GovernanceStore | None = 
     except (KeyError, ValueError, TypeError):
         pass
     demo_mode = isolated_demo_mode_enabled()
+    if demo_mode:
+        local_user = demo_user_for_token(token)
+        if local_user is not None:
+            return Principal(
+                subject=f"nexus:{local_user.employee_id}", tenant_id=NEXUS_TENANT_ID,
+                workspaces=(NEXUS_WORKSPACE_ID,), permissions=ROLE_PERMISSIONS[local_user.role_code],
+                source_ids=local_user.source_ids,
+            )
     if governance_store is not None and demo_mode:
         return resolve_demo_principal(token, governance_store, tenant_id=NEXUS_TENANT_ID,
                                       workspace_id=NEXUS_WORKSPACE_ID, demo_mode_enabled=demo_mode)
@@ -406,6 +416,13 @@ async def investigate(workspace_id: str, body: InvestigationRequestBody, request
 
 @app.get("/api/v1/nexus/session")
 def nexus_session(request: Request, user: Principal = Depends(principal)):
+    # Static local-demo session. No governance/PostgreSQL query needed.
+    if isolated_demo_mode_enabled():
+        local_auth = request.headers.get("authorization", "")
+        local_token = local_auth.split(" ", 1)[1].strip() if " " in local_auth else ""
+        local_user = demo_user_for_token(local_token)
+        if local_user is not None and user.subject == f"nexus:{local_user.employee_id}" and user.tenant_id == NEXUS_TENANT_ID:
+            return local_user.session_summary()
     governance_store = getattr(request.app.state, "governance_store", None)
     if governance_store is None or not user.subject.startswith("nexus:"):
         raise HTTPException(404, "Not a NEXUS demo identity")

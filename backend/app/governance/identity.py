@@ -13,7 +13,7 @@ import os
 from datetime import datetime, timezone
 
 from backend.app.governance.store import GovernanceStore
-from backend.app.security import Permission, Principal
+from backend.app.security import AuthorizationContext, Permission, Principal
 
 # A NEXUS demo identity only ever resolves within this one fixed tenant (see
 # scripts/import_nexus.py, which projects the dataset into the same tenant).
@@ -293,3 +293,33 @@ def nexus_identity_summary(token: str, store: GovernanceStore, *, demo_mode_enab
         "company_id": "nexus", "project_ids": project_ids, "source_ids": list(source_ids),
         "capabilities": role_data.get("capabilities", {}),
     }
+
+
+def recipient_authorized_sources(authorization: AuthorizationContext) -> frozenset[str] | None:
+    """ND-14B/14C shared helper (moved here from ``backend.app.agent.handoff`` to avoid a handoff<->
+    freshness import cycle — this is fundamentally a governance/identity concern, not a handoff one).
+    ``None`` means unrestricted (ADMIN or a non-NEXUS principal); otherwise the exact source set this
+    principal may CURRENTLY read, same composition every Stage 12/04 tool handler already uses (see
+    e.g. ``backend.app.tools.graph_tools._scoped_source_ids``)."""
+    governance_scope = authorized_source_ids_for(authorization.principal)
+    selection_scope = frozenset(authorization.principal.source_ids) if authorization.principal.source_ids else None
+    if governance_scope is None:
+        return selection_scope
+    if selection_scope is None:
+        return governance_scope
+    return governance_scope & selection_scope
+
+
+def principal_exists(subject: str, store: GovernanceStore) -> bool | None:
+    """ND-14C section 8: whether ``subject`` (a ``nexus:<employee_id>``-shaped identity) is a real,
+    known principal in the authoritative NEXUS employee registry. Returns ``None`` — explicitly
+    "unknown, cannot validate" — for any subject not in that shape, or when the registry itself has no
+    row for the implied employee_id in a way that would distinguish "doesn't exist" from "not NEXUS at
+    all"; callers must treat ``None`` as "validation unavailable", never as "valid". There is
+    deliberately no equivalent registry for non-NEXUS tenants in this codebase — this function does not
+    invent one."""
+    if not subject.startswith("nexus:"):
+        return None
+    employee_id = subject.removeprefix("nexus:")
+    rows = store.read("SELECT 1 FROM nexus_employees WHERE employee_id=%s", (employee_id,))
+    return bool(rows)

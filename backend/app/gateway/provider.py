@@ -21,10 +21,20 @@ class RawUsage:
 @dataclass(frozen=True)
 class RawFunctionCall:
     """A model-requested tool call as the provider reported it, before the
-    gateway maps it onto ``backend.app.gateway.contracts.FunctionCall``."""
+    gateway maps it onto ``backend.app.gateway.contracts.FunctionCall``.
+
+    ``thought_signature`` (Gemini 3.x "thinking" models only) is an opaque
+    signature the provider must be sent back unchanged alongside this exact
+    function call in the next turn's history, or the live API rejects the
+    request outright (HTTP 400: "Function call is missing a
+    thought_signature in functionCall parts") — verified against the real
+    API during ND-13C live acceptance; the offline ``FakeProviderClient``-
+    backed test suite never exercises this because it never round-trips a
+    real provider response. ``None`` for providers/models that don't use it."""
     id: str | None
     name: str
     arguments: dict
+    thought_signature: bytes | None = None
 
 
 @dataclass(frozen=True)

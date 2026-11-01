@@ -70,7 +70,8 @@ def _content_to_turn(content: types.Content) -> ConversationTurn | None:
         if part.function_call is not None:
             calls.append(GatewayFunctionCall(
                 id=part.function_call.id, name=part.function_call.name,
-                arguments=dict(part.function_call.args or {})))
+                arguments=dict(part.function_call.args or {}),
+                thought_signature=getattr(part, "thought_signature", None)))
         if part.function_response is not None:
             responses.append(GatewayFunctionResponse(
                 id=part.function_response.id, name=part.function_response.name,
@@ -143,6 +144,7 @@ class GatewayLlm(BaseLlm):
         run_state.record_llm_usage(
             input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens,
             total_tokens=response.usage.total_tokens, estimated_cost_usd=response.usage.estimated_cost_usd,
+            actual_model=response.actual_model,
         )
 
         if response.status is not ModelResultStatus.SUCCESS:
@@ -155,8 +157,11 @@ class GatewayLlm(BaseLlm):
         if response.text:
             parts.append(types.Part(text=response.text))
         for call in response.function_calls:
+            # ``thought_signature`` lives on the Part, not on FunctionCall itself (Gemini 3.x "thinking"
+            # models reject a later replayed function-call turn that is missing it — see
+            # backend.app.gateway.provider.RawFunctionCall).
             parts.append(types.Part(function_call=types.FunctionCall(
-                id=call.id, name=call.name, args=call.arguments)))
+                id=call.id, name=call.name, args=call.arguments), thought_signature=call.thought_signature))
 
         usage_metadata = types.GenerateContentResponseUsageMetadata(
             prompt_token_count=response.usage.input_tokens,

@@ -35,6 +35,7 @@ def _translate(exc: Exception) -> ProviderError:
     if status == 404:
         return ModelUnavailableError(message)
     if status == 429:
+        print("GEMINI 429 DETAILS:", message, flush=True)
         return RateLimitedError(message)
     if status is not None and 500 <= status < 600:
         return ProviderUnavailableError(message)
@@ -123,7 +124,8 @@ class GeminiProviderClient:
                 call = getattr(part, "function_call", None)
                 if call is not None:
                     collected.append(RawFunctionCall(
-                        id=getattr(call, "id", None), name=call.name, arguments=dict(call.args or {})))
+                        id=getattr(call, "id", None), name=call.name, arguments=dict(call.args or {}),
+                        thought_signature=getattr(part, "thought_signature", None)))
             function_calls = tuple(collected)
 
         text = None

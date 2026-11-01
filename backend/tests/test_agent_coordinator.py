@@ -88,20 +88,16 @@ def _authorization(permissions) -> AuthorizationContext:
 def test_coordinated_investigation_runs_distinct_specialist_passes(tool_registry, skill_registry, tool_executor):
     provider = FakeProviderClient()
     provider.queue = [
-        # DISCOVERY pass
+        # DISCOVERY pass (ADK, model-driven)
         _success(function_calls=(RawFunctionCall(id="d1", name="skill_discover", arguments={}),)),
         _success(function_calls=(RawFunctionCall(id="d2", name="skill_load_instructions",
                                                  arguments={"skill_id": "graph-trace"}),)),
         _success(function_calls=(RawFunctionCall(id="d3", name="graph_entity_lookup",
                                                  arguments={"entity_id": "pr-42"}),)),
         _success(text="Looked up pr-42; no graph store was reachable."),
-        # IMPACT pass
-        _success(function_calls=(RawFunctionCall(id="i1", name="skill_discover", arguments={}),)),
-        _success(function_calls=(RawFunctionCall(id="i2", name="skill_load_instructions",
-                                                 arguments={"skill_id": "pr-impact"}),)),
-        _success(function_calls=(RawFunctionCall(id="i3", name="pr_change_impact",
-                                                 arguments={"pr_id": "pr-42"}),)),
-        _success(text="Called pr.change_impact for pr-42; no graph store was reachable to resolve it."),
+        # IMPACT pass (ND-13E: deterministic-first -- no ADK/skill_discover round trip at all; it calls
+        # pr.change_impact directly. With no graph store wired here that call fails deterministically, so
+        # no narrative call is even attempted -- this queue item is never consumed.
     ]
     gateway = ModelGateway(provider, _router())
     authorization = _authorization({Permission.READ_GRAPH, Permission.READ_EVIDENCE, Permission.EXECUTE_TOOL})
@@ -111,18 +107,27 @@ def test_coordinated_investigation_runs_distinct_specialist_passes(tool_registry
         request, authorization, "coord-1", gateway, tool_registry, tool_executor, skill_registry))
 
     roles = [s.role for s in result.specialist_results]
-    assert roles == [SpecialistRole.DISCOVERY, SpecialistRole.IMPACT, SpecialistRole.SYNTHESIS]
+    assert roles == [SpecialistRole.DISCOVERY, SpecialistRole.IMPACT, SpecialistRole.VERIFICATION,
+                     SpecialistRole.SYNTHESIS]
 
-    discovery, impact, synthesis = result.specialist_results
+    discovery, impact, verification, synthesis = result.specialist_results
     assert discovery.skill_used is not None and discovery.skill_used.skill_id == "graph-trace"
+    # ND-13E: IMPACT is deterministic-first -- its skill is still resolved/trust-checked even though no
+    # LLM ever called skill_discover/skill_load_instructions for it.
     assert impact.skill_used is not None and impact.skill_used.skill_id == "pr-impact"
     assert "pr.change_impact" in impact.tool_ids_called  # the impact specialist really called a Stage 12 tool
     assert "graph.entity_lookup" in discovery.tool_ids_called
+    assert impact.model_used is None  # tool call failed (no graph store) -- no narrative was even attempted
 
     # evidence/uncertainty/provenance survive the handoff into the synthesized result
     assert synthesis.role == SpecialistRole.SYNTHESIS
-    assert result.verification_status == "PENDING_INDEPENDENT_VERIFICATION"
-    assert provider.calls == 8
+    assert verification.role == SpecialistRole.VERIFICATION
+    # No real graph store is wired here, so the verifier's own independent re-fetch of pr.change_impact
+    # comes back NOT_FOUND too -- only the weaker entity-existence check ran (no DEPENDENCY_PATH claim),
+    # so this must be reported as PARTIALLY_VERIFIED, never the stronger INDEPENDENTLY_VERIFIED (ND-13C
+    # section 1 fix; see a real, graph-store-backed example in test_agent_verifier.py).
+    assert result.verification_status == "PARTIALLY_VERIFIED"
+    assert provider.calls == 4  # discovery's 4 ADK calls only -- impact never reaches the model at all here
     assert result.status in (InvestigationStatus.PARTIAL, InvestigationStatus.COMPLETE,
                              InvestigationStatus.INCOMPLETE)
 
@@ -184,13 +189,13 @@ def test_authorization_is_refreshed_and_narrowed_between_specialist_passes(tool_
         _success(function_calls=(RawFunctionCall(id="d2", name="skill_load_instructions",
                                                  arguments={"skill_id": "graph-trace"}),)),
         _success(text="No authorized tool was available after the access revocation."),
-        _success(function_calls=(RawFunctionCall(id="i1", name="skill_discover", arguments={}),)),
-        _success(function_calls=(RawFunctionCall(id="i2", name="skill_load_instructions",
-                                                 arguments={"skill_id": "pr-impact"}),)),
-        _success(text="No authorized tool is available to assess this PR's impact."),
+        # IMPACT (ND-13E: deterministic-first) never reaches the model here -- pr.change_impact is denied
+        # by the executor itself (FORBIDDEN) before any narrative call would be attempted.
     ]
     gateway = ModelGateway(provider, _router())
-    request = InvestigationRequest(question="What could be affected by deploying PR-42?")
+    # entity_id supplied explicitly: IMPACT's deterministic pass needs a concrete entity id to call its
+    # tool with (it does not explore conversationally the way the old LLM-driven pass could).
+    request = InvestigationRequest(question="What could be affected by deploying PR-42?", entity_id="pr-42")
 
     from unittest.mock import patch
     with patch("backend.app.agent.coordinator.refresh_authorization",
@@ -198,12 +203,13 @@ def test_authorization_is_refreshed_and_narrowed_between_specialist_passes(tool_
         result = asyncio.run(run_coordinated_investigation(
             request, authorization, "coord-2", gateway, tool_registry, tool_executor, skill_registry))
 
-    assert spy.call_count == 2  # once before discovery, once before impact -- never a single cached refresh
+    assert spy.call_count == 3  # once per pass: discovery, impact, verification -- never a single cached refresh
     for call in spy.call_args_list:
         assert call.args[0] is authorization  # always derived from the server-trusted base context
 
-    discovery, impact, synthesis = result.specialist_results
-    assert discovery.tool_ids_called == () and impact.tool_ids_called == ()
+    by_role = {s.role: s for s in result.specialist_results}
+    assert by_role[SpecialistRole.DISCOVERY].tool_ids_called == ()
+    assert by_role[SpecialistRole.IMPACT].status == InvestigationStatus.BLOCKED  # denied, not fabricated
     assert result.evidence_refs == () and result.entity_ids == ()  # nothing forbidden leaked into the synthesis
 
 
@@ -230,7 +236,9 @@ def test_shared_budget_bounds_both_specialist_passes(tool_registry, skill_regist
     ]
     gateway = ModelGateway(provider, _router())
     authorization = _authorization({Permission.READ_GRAPH, Permission.READ_EVIDENCE, Permission.EXECUTE_TOOL})
-    request = InvestigationRequest(question="What could be affected by deploying PR-42?")
+    # entity_id supplied explicitly so IMPACT's deterministic pass has a concrete id to analyze -- this
+    # test is specifically about the shared TOOL-CALL budget stopping it, not about entity resolution.
+    request = InvestigationRequest(question="What could be affected by deploying PR-42?", entity_id="pr-42")
     budget = CoordinatorBudget(max_total_tool_calls=2, max_total_llm_calls=20, overall_timeout_seconds=60)
 
     result = asyncio.run(run_coordinated_investigation(

@@ -51,7 +51,13 @@ def _turn_payload(turn: ConversationTurn) -> dict:
     """Maps one ``ConversationTurn`` onto a plain ``{"role", "parts"}`` dict
     shaped like the google-genai SDK's own ``Content``/``Part`` — the real
     SDK accepts this dict form directly (see ``gemini_client.py``), so no
-    SDK-specific type is constructed here."""
+    SDK-specific type is constructed here.
+
+    ``thought_signature`` is a ``Part``-level field in the SDK's schema, a
+    sibling of ``function_call`` — never nested inside it (verified against
+    ``google.genai.types.Part``/``FunctionCall``'s own field lists). Gemini
+    3.x rejects a replayed function-call turn missing it outright (see
+    ``backend.app.gateway.provider.RawFunctionCall``)."""
     parts: list[dict] = []
     if turn.text:
         parts.append({"text": turn.text})
@@ -59,7 +65,10 @@ def _turn_payload(turn: ConversationTurn) -> dict:
         part = {"name": call.name, "args": call.arguments}
         if call.id:
             part["id"] = call.id
-        parts.append({"function_call": part})
+        part_payload: dict = {"function_call": part}
+        if call.thought_signature:
+            part_payload["thought_signature"] = call.thought_signature
+        parts.append(part_payload)
     for response in turn.function_responses:
         part = {"name": response.name, "response": response.response}
         if response.id:
@@ -223,7 +232,8 @@ class ModelGateway:
 
         text = provider_response.text if request.output_schema is None else None
         function_calls = tuple(
-            FunctionCall(id=call.id, name=call.name, arguments=call.arguments)
+            FunctionCall(id=call.id, name=call.name, arguments=call.arguments,
+                        thought_signature=call.thought_signature)
             for call in provider_response.function_calls
         )
         payload_bytes = len((structured and str(structured) or text or "").encode("utf-8"))

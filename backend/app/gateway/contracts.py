@@ -59,10 +59,17 @@ class FunctionDeclaration(Record):
 class FunctionCall(Record):
     """A model-requested tool invocation. ``arguments`` are whatever the
     model produced — never trusted as authorized input until validated and
-    executed by ``backend.app.tools.executor.ToolExecutor``."""
+    executed by ``backend.app.tools.executor.ToolExecutor``.
+
+    ``thought_signature`` (Gemini 3.x "thinking" models) must be carried
+    forward unchanged alongside this exact call when it is replayed as
+    history in a later turn — see ``backend.app.gateway.provider.
+    RawFunctionCall`` for why. Opaque; never inspected or modified, only
+    round-tripped."""
     id: str | None = None
     name: str = Field(min_length=1)
     arguments: dict = Field(default_factory=dict)
+    thought_signature: bytes | None = None
 
 
 class FunctionResponse(Record):
