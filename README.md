@@ -22,40 +22,15 @@ The relevant facts are spread across different records:
 
 ### Without NODUS
 
-```mermaid
-flowchart TD
-    A["Proposal: remove user_id from Authentication API"]
-    B["Authentication team updates API contract"]
-    C["API-local tests pass"]
-    D["Review may miss the Checkout dependency"]
-    E["Checkout still expects user_id"]
-    F["Integration test or live request fails"]
-    G["Teams trace code, tickets, and ownership manually"]
-    A --> B --> C --> D --> E --> F --> G
-```
+<img width="568" height="1452" alt="mermaid-diagram" src="https://github.com/user-attachments/assets/fadd79ff-c71e-45a8-a320-f367bd4e7017" />
+
 
 The risk is **not** that teams have no tests or that every change will fail. Good contract and integration tests may catch the break. The problem is that **local approval does not automatically provide cross-team context**: a developer may not know which consumers, decisions, or teams need to be consulted.
 
 ### With NODUS — intended end-to-end workflow
 
-```mermaid
-flowchart TD
-    A["Investigate proposed Authentication API change"]
-    B["Select sources and enforce permissions"]
-    C["Search contracts, Checkout code, and service records"]
-    D["Trace dependency: Authentication API to Checkout"]
-    E["Verify risk with exact contract and code evidence"]
-    F{"Evidence sufficient?"}
-    G["Explain supported risk and supporting evidence"]
-    X["Mark unverified and request missing evidence"]
-    H["Identify Authentication and Checkout owning teams"]
-    I["Create evidence-linked remediation tasks"]
-    J["Notify teams through approved channels"]
-    K["Track fixes and re-verify evidence"]
-    A --> B --> C --> D --> E --> F
-    F -->|Yes| G --> H --> I --> J --> K
-    F -->|No| X
-```
+<img width="1186" height="2812" alt="mermaid-diagram (1)" src="https://github.com/user-attachments/assets/12604f57-cbf6-4ae9-9621-c1801c4d73b8" />
+
 
 **The important distinction:** NODUS should not merely answer *“Checkout might be affected.”* It should show *why*: the declared dependency, the contract field being changed, and the consumer code that still uses that field. Then it should connect the risk to the teams able to resolve it and make the next action explicit. A missing or inaccessible source must not be presented as proof.
 
@@ -72,28 +47,8 @@ The diagram above represents the **complete product workflow**. Graph search and
 
 ## 2. How the system works
 
-```mermaid
-flowchart TD
-    UI["React + TypeScript investigation UI"]
-    API["FastAPI session and investigation APIs"]
-    AUTH["Identity, roles, and source authorization"]
-    COORD["Investigation coordinator"]
-    SEARCH["Read-only source search tools"]
-    GRAPHDB["Neo4j relationship graph"]
-    GEMINI["Gemini reasoning and synthesis"]
-    STATE["PostgreSQL investigation state"]
-    VERIFY["Structured evidence verification - in progress"]
-    OWNER["Resolve responsible teams - planned"]
-    TASK["Task creation and notifications - planned"]
-    REPORT["Impact report, evidence, and follow-up status"]
-    UI --> API --> AUTH --> COORD
-    COORD <--> SEARCH
-    COORD <--> GRAPHDB
-    COORD <--> GEMINI
-    COORD <--> STATE
-    COORD --> VERIFY --> OWNER --> TASK --> REPORT
-    VERIFY --> REPORT
-```
+<img width="2492" height="1930" alt="mermaid-diagram (2)" src="https://github.com/user-attachments/assets/40539021-f1fb-407f-b98d-d0b9ddd38d88" />
+
 
 ### What each component does
 
