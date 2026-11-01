@@ -6,6 +6,7 @@ export interface AuthorizationContext {
   company: { id: string; name: string };
   projects: readonly { id: string; name: string }[];
   permissions: readonly string[];
+  sourceIds?: readonly string[];
   capabilities: { requestAccess: boolean; reviewAccessRequests: boolean };
 }
 

@@ -128,12 +128,14 @@ for (const width of [390, 1280, 1920]) {
       .getByRole("button", { name: "Start investigation", exact: true })
       .click();
     expect((await submitted).postDataJSON()).toEqual({
+      project_id: "A1",
       objective: "Which services depend on the customer database?",
       selected_source_ids: ["source-a"],
     });
     await expect(
-      page.getByRole("heading", { name: "Investigation result", exact: true }),
+      page.getByRole("region", { name: "Investigation result", exact: true }),
     ).toBeVisible();
+    await page.getByRole("tab", { name: "Evidence", exact: true }).click();
     await expect(
       page.getByText("Source A:record-1", { exact: true }),
     ).toBeVisible();
@@ -339,7 +341,7 @@ test("readable source names preserve multi-source request IDs across the complet
     catalog,
   ]);
   await expect(
-    page.getByRole("heading", { name: "Investigation result", exact: true }),
+    page.getByRole("region", { name: "Investigation result", exact: true }),
   ).toBeVisible();
   await expect(
     page
@@ -505,17 +507,51 @@ test("sidebar follows permissions rather than the role name and rejects protecte
   ).toHaveCount(0);
 });
 
-test('duplicate source names remain individually selectable by original ID', async ({ page }) => {
-  await mockWorkspace(page)
-  await page.route('**/nexus/sources', route => route.fulfill({ json: { items: [
-    { source_id: 'catalog-one', display_name: 'Shared Catalog', owner_project_id: 'A1' },
-    { source_id: 'catalog-two', display_name: 'Shared Catalog', owner_project_id: 'A1' },
-  ] } }))
-  await login(page)
-  await page.getByRole('checkbox', { name: 'Shared Catalog (catalog-two)', exact: true }).check()
-  await expect(page.getByRole('checkbox', { name: 'Shared Catalog (catalog-one)', exact: true })).not.toBeChecked()
-  await page.getByLabel('What would you like to investigate?').fill('Inspect catalog')
-  const submitted = page.waitForRequest(r => r.url().endsWith('/engineering/investigations'))
-  await page.getByRole('button', { name: 'Start investigation', exact: true }).click()
-  expect((await submitted).postDataJSON().selected_source_ids).toEqual(['catalog-two'])
-})
+test("duplicate source names remain individually selectable by original ID", async ({
+  page,
+}) => {
+  await mockWorkspace(page);
+  await page.route("**/nexus/sources", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            source_id: "catalog-one",
+            display_name: "Shared Catalog",
+            owner_project_id: "A1",
+          },
+          {
+            source_id: "catalog-two",
+            display_name: "Shared Catalog",
+            owner_project_id: "A1",
+          },
+        ],
+      },
+    }),
+  );
+  await login(page);
+  await page
+    .getByRole("checkbox", {
+      name: "Shared Catalog (catalog-two)",
+      exact: true,
+    })
+    .check();
+  await expect(
+    page.getByRole("checkbox", {
+      name: "Shared Catalog (catalog-one)",
+      exact: true,
+    }),
+  ).not.toBeChecked();
+  await page
+    .getByLabel("What would you like to investigate?")
+    .fill("Inspect catalog");
+  const submitted = page.waitForRequest((r) =>
+    r.url().endsWith("/engineering/investigations"),
+  );
+  await page
+    .getByRole("button", { name: "Start investigation", exact: true })
+    .click();
+  expect((await submitted).postDataJSON().selected_source_ids).toEqual([
+    "catalog-two",
+  ]);
+});

@@ -134,6 +134,7 @@ class Entity(BaseModel):
     # — "why this claim is or is not authoritative" — never a resolved value;
     # `conflicts` above remains the complete, unmodified source of truth.
     authority: dict[str, dict] = Field(default_factory=dict)
+    provenance: list[dict] = Field(default_factory=list)
 
 
 class Relationship(BaseModel):

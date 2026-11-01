@@ -28,7 +28,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from backend.app.governance.identity import authorized_source_ids_for
+from backend.app.governance.identity import recipient_authorized_sources
 from backend.app.graph.models import Entity, EntityType, Relationship
 from backend.app.graph.repository import GraphRepository
 from backend.app.security import AuthorizationContext, Permission
@@ -98,19 +98,7 @@ def _repository(context: AuthorizationContext, dependencies: ToolDependencies) -
 
 
 def _scoped_source_ids(context: AuthorizationContext) -> frozenset[str] | None:
-    """See ``backend.app.tools.graph_tools._scoped_source_ids`` (Stage 11
-    ND-11A). A restricted blocker's own entity never resolves through
-    ``GraphRepository.neighborhood`` for an unauthorized/unselected caller
-    (it is excluded at the node-resolution step, not redacted afterward), so
-    a hidden blocker is never revealed merely by participating in another
-    issue's chain."""
-    governance_scope = authorized_source_ids_for(context.principal)
-    selection_scope = frozenset(context.principal.source_ids) if context.principal.source_ids else None
-    if governance_scope is None:
-        return selection_scope
-    if selection_scope is None:
-        return governance_scope
-    return governance_scope & selection_scope
+    return recipient_authorized_sources(context)
 
 
 def _evidence_ref(rel: Relationship) -> str | None:

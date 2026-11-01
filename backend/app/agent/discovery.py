@@ -45,7 +45,7 @@ from backend.app.agent.contracts import (
 from backend.app.agent.investigator import run_investigation
 from backend.app.contracts import Record
 from backend.app.gateway.gateway import ModelGateway
-from backend.app.governance.identity import authorized_source_ids_for
+from backend.app.governance.identity import authorized_source_ids_for, NEXUS_TENANT_ID
 from backend.app.graph.authority import AuthorityRule
 from backend.app.graph.models import AssertionOrigin, EntityInput, RelationInput, RelationType, SourceRecordInput
 from backend.app.graph.ontology import validate_relationship
@@ -111,7 +111,7 @@ def effective_source_scope(selected_source_ids: Sequence[str], principal: Princi
     if not selected:
         return frozenset()
     governance_scope = authorized_source_ids_for(principal)
-    own_scope = frozenset(principal.source_ids) if principal.source_ids else None
+    own_scope = frozenset(principal.source_ids) if principal.source_ids or principal.tenant_id == NEXUS_TENANT_ID else None
     if governance_scope is None and own_scope is None:
         return selected
     if governance_scope is None:
@@ -137,6 +137,7 @@ async def run_scoped_investigation(
     approved_skills: tuple[ApprovedSkill, ...] = (ApprovedSkill(skill_id="graph-trace", version="1.0.0"),),
     limits: RuntimeLimits | None = None,
     entity_id: str | None = None,
+    project_id: str | None = None,
 ) -> InvestigationResult:
     """ND-11A scoped entry point.
 
@@ -144,7 +145,18 @@ async def run_scoped_investigation(
     enter run scope; an empty effective scope returns a ``BLOCKED`` result
     without starting an agent run at all (never silently runs unscoped).
     """
+    from backend.app.governance.identity import refresh_principal_source_ids
+    governance = tool_executor.dependencies.governance_store
+    if governance is not None:
+        principal = refresh_principal_source_ids(principal, governance)
+        from backend.app.governance.identity import investigation_read_principal
+        principal = investigation_read_principal(principal, tuple(selected_source_ids), project_id, governance)
     scope = effective_source_scope(selected_source_ids, principal)
+    if scope:
+        scope = GraphRepository(graph_store, principal.tenant_id, workspace_id, principal.subject,
+            allow_all=Permission.ADMIN in principal.permissions,
+            can_evidence=Permission.READ_EVIDENCE in principal.permissions,
+            authorized_source_ids=scope).available_source_ids(scope)
     if not scope:
         return InvestigationResult(
             run_id=run_id, status=InvestigationStatus.BLOCKED,
@@ -160,24 +172,40 @@ async def run_scoped_investigation(
     permissions = scoped_principal.permissions
     auth = AuthorizationContext(
         principal=scoped_principal, tenant_id=scoped_principal.tenant_id, workspace_id=workspace_id,
-        task_id=run_id, permissions=permissions)
+        task_id=run_id, permissions=permissions, selected_source_ids=tuple(sorted(scope)), project_id=project_id)
     exec_context = AgentExecutionContext(
         authorization=auth, run_id=run_id, approved_skills=approved_skills, limits=limits or RuntimeLimits())
     request = InvestigationRequest(question=objective, entity_id=entity_id)
 
     result = await run_investigation(request, exec_context, model_gateway, tool_registry, tool_executor,
                                      skill_registry)
+    result = result.model_copy(update={"requested_source_ids": tuple(dict.fromkeys(selected_source_ids)),
+                                       "project_id": project_id})
 
+    from backend.app.agent.tool_bridge import refresh_authorization
+    from backend.app.governance.identity import recipient_authorized_sources
+    auth = refresh_authorization(auth, tool_executor)
+    current_scope = recipient_authorized_sources(auth)
+    if not auth.principal.permits(Permission.READ_GRAPH) or not auth.principal.permits(Permission.EXECUTE_TOOL) or (
+            current_scope is not None and not scope <= current_scope):
+        return InvestigationResult(run_id=run_id, status=InvestigationStatus.BLOCKED,
+            summary="Investigation access changed; report content is unavailable.",
+            verification_status="SOURCE_RESTRICTED", model_usage=result.model_usage)
+    scope = current_scope or frozenset()
+    scoped_principal = auth.principal
+    if Permission.READ_GRAPH not in auth.permissions or not scope:
+        return InvestigationResult(run_id=run_id, status=InvestigationStatus.BLOCKED,
+            summary="Investigation access changed; report content is unavailable.",
+            verification_status="SOURCE_RESTRICTED", model_usage=result.model_usage)
     observed_entities = frozenset(result.entity_ids)
-    if not observed_entities or not (Permission.READ_GRAPH in permissions):
-        return result  # nothing Step A actually observed to expand from
-
-    can_evidence = Permission.READ_EVIDENCE in permissions
-    allow_all = Permission.ADMIN in permissions
+    if not observed_entities:
+        return result
+    can_evidence = Permission.READ_EVIDENCE in auth.permissions or Permission.ADMIN in auth.permissions
+    allow_all = Permission.ADMIN in auth.permissions
     read_repo = GraphRepository(
         graph_store, scoped_principal.tenant_id, workspace_id, scoped_principal.subject,
         allow_all=allow_all, can_evidence=can_evidence, authority_rules=authority_rules,
-        authorized_source_ids=None if allow_all else scope)
+        authorized_source_ids=scope)
     if not read_repo.can_evidence:
         return result  # no evidence permission -> no evidence-backed candidates can ever be built
 

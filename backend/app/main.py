@@ -10,9 +10,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.app.agent.discovery import run_scoped_investigation
+from backend.app.agent.persistence import InvestigationStore
+from backend.app.agent.contracts import InvestigationResult
 from backend.app.config import Settings
 from backend.app.gateway.config import GatewayConfig
 from backend.app.gateway.gateway import ModelGateway
@@ -129,10 +131,14 @@ async def lifespan(app: FastAPI):
         # simply unavailable without it, exactly as before this feature
         # existed — it was never a hard requirement for the app to start.
         app.state.governance_store = None
+        app.state.investigation_store = None
         if settings.postgres_dsn:
             governance_store = GovernanceStore(settings.postgres_dsn)
             governance_store.start()
             app.state.governance_store = governance_store
+            investigation_store = InvestigationStore(settings.postgres_dsn)
+            investigation_store.start()
+            app.state.investigation_store = investigation_store
 
         # Stage 11 (ND-11A): the deterministic tool/skill layer needs no
         # external credential and is always wired up; the real Gemini model
@@ -387,6 +393,7 @@ class InvestigationRequestBody(BaseModel):
     objective: str
     selected_source_ids: list[str] = []
     entity_id: str | None = None
+    project_id: str | None = None
 
 
 @app.post("/api/v1/workspaces/{workspace_id}/investigations")
@@ -401,6 +408,10 @@ async def investigate(workspace_id: str, body: InvestigationRequestBody, request
     ``BLOCKED`` result rather than running unscoped."""
     if workspace_id not in user.workspaces:
         raise HTTPException(404, "Workspace not available")
+    if body.project_id and user.tenant_id == NEXUS_TENANT_ID:
+        summary = nexus_session(request, user)
+        if body.project_id not in summary["project_ids"]:
+            raise HTTPException(404, "Project not available")
     model_gateway = getattr(request.app.state, "model_gateway", None)
     if model_gateway is None:
         raise HTTPException(503, "Model gateway is not configured for this deployment")
@@ -410,8 +421,429 @@ async def investigate(workspace_id: str, body: InvestigationRequestBody, request
         model_gateway=model_gateway, tool_registry=request.app.state.tool_registry,
         tool_executor=request.app.state.tool_executor, skill_registry=request.app.state.skill_registry,
         authority_rules=request.app.state.authority_rules, entity_id=body.entity_id,
+        project_id=body.project_id,
     )
+    if result.selected_source_ids and result.status.value != "BLOCKED":
+        from backend.app.resolution import enrich_resolution
+        from backend.app.security import AuthorizationContext
+        from backend.app.agent.tool_bridge import refresh_authorization
+        from backend.app.tools.graph_tools import _repository
+        auth = AuthorizationContext(principal=user,tenant_id=user.tenant_id,workspace_id=workspace_id,
+            task_id=result.run_id,permissions=user.permissions,selected_source_ids=result.selected_source_ids,
+            project_id=body.project_id)
+        auth = refresh_authorization(auth,request.app.state.tool_executor)
+        try:
+            result = enrich_resolution(result, _repository(auth,request.app.state.tool_executor.dependencies))
+        except Exception:
+            result = result.model_copy(update={"resolution_status":"UNAVAILABLE",
+                "source_coverage_limitations":(*result.source_coverage_limitations,
+                                               "Problem and ownership evaluation was unavailable; no automatic task was created.")})
+    if user.permits("READ_EVIDENCE"):
+        try:
+            result = _authorized_report({"selected_source_ids": result.selected_source_ids,
+                                         "result_json": result.model_dump(mode="json")}, request, user, workspace_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            from backend.app.agent.contracts import InvestigationStatus
+            result = InvestigationResult(run_id=result.run_id, status=InvestigationStatus.BLOCKED,
+                summary="Investigation access changed; report content is unavailable.",
+                verification_status="SOURCE_RESTRICTED", model_usage=result.model_usage)
+    report_store = getattr(request.app.state, "investigation_store", None)
+    if report_store is not None:
+        result = result.model_copy(update={"persistence_status": "PERSISTED"})
+        try:
+            report_store.save_report(result=result, tenant_id=user.tenant_id, workspace_id=workspace_id,
+                                     principal_subject=user.subject, objective=body.objective,
+                                     selected_source_ids=result.selected_source_ids)
+        except Exception:
+            result = result.model_copy(update={"persistence_status": "FAILED",
+                "source_coverage_limitations": (*result.source_coverage_limitations,
+                                                "Report persistence failed; this result is session-only.")})
+        else:
+            try:
+                from backend.app.task_service import create_tasks
+                result = create_tasks(result,user,workspace_id,report_store,request.app.state.graph_store,
+                                      getattr(request.app.state,"governance_store",None))
+            except Exception:
+                result = result.model_copy(update={"resolution_status":"UNAVAILABLE",
+                    "source_coverage_limitations":(*result.source_coverage_limitations,
+                        "The report was saved, but task creation did not finish. Review Tasks for completed assignments before retrying.")})
     return result.model_dump(mode="json")
+
+
+def _owned_report_rows(request: Request, user: Principal, workspace_id: str, run_id: str | None = None):
+    if workspace_id not in user.workspaces:
+        raise HTTPException(404, "Investigation not available")
+    store = getattr(request.app.state, "investigation_store", None)
+    if store is None:
+        raise HTTPException(503, "Investigation persistence is unavailable")
+    return store.owned_reports(tenant_id=user.tenant_id, workspace_id=workspace_id,
+                               principal_subject=user.subject, run_id=run_id)
+
+
+def _authorized_report(row, request: Request, user: Principal, workspace_id: str):
+    from backend.app.governance.identity import refresh_principal_source_ids
+    governance = getattr(request.app.state, "governance_store", None)
+    current = refresh_principal_source_ids(user, governance) if governance is not None else user
+    scope = authorized_source_ids_for(current)
+    if not current.permits("READ_GRAPH") or not current.permits("READ_EVIDENCE"):
+        raise HTTPException(404, "Investigation not available")
+    selection = frozenset(row["selected_source_ids"])
+    if scope is not None and not selection <= scope:
+        raise HTTPException(404, "Investigation not available")
+    if current.source_ids and not selection <= frozenset(current.source_ids):
+        raise HTTPException(404, "Investigation not available")
+    result = InvestigationResult.model_validate(row["result_json"])
+    if governance is not None:
+        from backend.app.governance.identity import investigation_read_principal
+        readable = investigation_read_principal(current, tuple(selection), result.project_id, governance)
+        if not readable.permits("READ_GRAPH") or not selection <= frozenset(readable.source_ids):
+            raise HTTPException(404, "Investigation not available")
+    if not result.evidence_registry:
+        return result
+    repo = repository(request, current, workspace_id)
+    for evidence in result.evidence_registry:
+        _require_nexus_action(request, current, evidence.source_id, "READ")
+        if evidence.run_id != result.run_id or evidence.source_id not in selection or (
+                repo.source_record(evidence.source_id, evidence.record_id, include_history=evidence.include_history) is None):
+            raise HTTPException(404, "Investigation not available")
+        if evidence.kind == "GRAPH_RELATIONSHIP":
+            edge = json.loads(evidence.excerpt)
+            if repo.relationship(edge["id"], include_history=evidence.include_history) is None:
+                # Missing and no-longer-authorized edges are deliberately indistinguishable.
+                raise HTTPException(404, "Investigation not available")
+    from backend.app.agent.verifier import verify_snapshots, snapshots_accessible
+    if not snapshots_accessible({item.evidence_id: item for item in result.evidence_registry}, repo):
+        raise HTTPException(404, "Investigation not available")
+    paths = tuple({"nodes": finding.entity_ids, "relationships": finding.relationship_ids}
+                  for finding in result.structured_findings if finding.claim_type == "GRAPH_PATH")
+    rechecked = verify_snapshots({item.evidence_id: item for item in result.evidence_registry}, repo, paths)
+    findings = (*rechecked, *(finding for finding in result.structured_findings
+                              if finding.claim_type not in ("GRAPH_RELATIONSHIP", "GRAPH_PATH")))
+    counts = {}
+    for finding in findings:
+        counts[finding.verification_status] = counts.get(finding.verification_status, 0) + 1
+    entities = set(result.entity_ids) | {entity for finding in rechecked for entity in finding.entity_ids}
+    return result.model_copy(update={"structured_findings": findings, "verification_summary": counts,
+        "entity_ids": tuple(sorted(entities)),
+        "verification_status": "PARTIALLY_VERIFIED" if counts.get("SUPPORTED") else "UNVERIFIED"})
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/investigations")
+def list_investigations(workspace_id: str, request: Request,
+                       user: Principal = Depends(require("READ_GRAPH"))):
+    items = []
+    for row in _owned_report_rows(request, user, workspace_id):
+        try:
+            result = _authorized_report(row, request, user, workspace_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                continue
+            raise
+        items.append({"run_id": result.run_id, "objective": row["objective"],
+                      "status": result.status, "created_at": row["created_at"],
+                      "project_id": result.project_id})
+    return {"items": items}
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/investigations/{run_id}")
+def get_investigation(workspace_id: str, run_id: str, request: Request,
+                      user: Principal = Depends(require("READ_GRAPH"))):
+    rows = _owned_report_rows(request, user, workspace_id, run_id)
+    if not rows:
+        store = request.app.state.investigation_store
+        from backend.app.task_service import live_principal
+        current = live_principal(user,getattr(request.app.state,"governance_store",None))
+        if "MANAGE_TASKS" in current.permissions:
+            row = store.task_report(user.tenant_id,workspace_id,run_id)
+            if row:
+                rows = [row]
+        for task_row in store.tasks_for_investigation(user.tenant_id,workspace_id,run_id):
+            try:
+                from backend.app.task_service import visible_task
+                visible_task(task_row,user,request.app.state.graph_store,getattr(request.app.state,"governance_store",None))
+            except PermissionError:
+                continue
+            row = store.task_report(user.tenant_id,workspace_id,run_id)
+            if row:
+                rows = [row]
+            break
+        if not rows:
+            raise HTTPException(404, "Investigation not available")
+    result = _authorized_report(rows[0], request, user, workspace_id)
+    tasks = request.app.state.investigation_store.tasks_for_investigation(user.tenant_id,workspace_id,run_id)
+    linked = {row["task_json"]["finding"]["problem_id"]:row["task_id"] for row in tasks}
+    result = result.model_copy(update={"actionable_findings":tuple(problem.model_copy(
+        update={"task_id":linked.get(problem.problem_id)}) for problem in result.actionable_findings),
+        "resolution_status":"TASKS_CREATED" if linked else "REVIEW_REQUIRED" if result.actionable_findings else
+            result.resolution_status if result.resolution_status in ("NOT_EVALUATED","UNAVAILABLE") else "NO_VERIFIED_PROBLEM"})
+    return {**result.model_dump(mode="json"),"objective":rows[0]["objective"],"created_at":rows[0]["created_at"]}
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/investigations/{run_id}/evidence/{evidence_id}")
+def investigation_evidence(workspace_id: str, run_id: str, evidence_id: str, request: Request,
+                           user: Principal = Depends(require("READ_EVIDENCE"))):
+    result = get_investigation(workspace_id, run_id, request, user)
+    for evidence in result["evidence_registry"]:
+        if evidence["evidence_id"] == evidence_id:
+            return evidence
+    raise HTTPException(404, "Evidence not available")
+
+
+def _task_store(request, user, workspace_id):
+    if workspace_id not in user.workspaces:
+        raise HTTPException(404,"Workspace not available")
+    store = getattr(request.app.state,"investigation_store",None)
+    if store is None:
+        raise HTTPException(503,"Task persistence is not configured")
+    return store
+
+
+def _visible_task(request, user, row):
+    from backend.app.task_service import visible_task
+    try:
+        return visible_task(row,user,request.app.state.graph_store,getattr(request.app.state,"governance_store",None))
+    except (PermissionError,ValueError):
+        raise HTTPException(404,"Task not available")
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/tasks")
+def list_tasks(workspace_id: str, request: Request, project_id: str | None = None,
+               team_id: str | None = None, status: str | None = None,
+               user: Principal = Depends(require("READ_GRAPH"))):
+    store = _task_store(request,user,workspace_id)
+    items = []
+    for row in store.resolution_tasks(user.tenant_id,workspace_id):
+        try:
+            task,_,current,_ = _visible_task(request,user,row)
+        except HTTPException:
+            continue
+        if project_id and task.project_id != project_id or team_id and team_id != task.primary_team_id or status and status != task.status:
+            continue
+        items.append(task.model_dump(mode="json"))
+    return {"items":items}
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/tasks/{task_id}")
+def get_task(workspace_id: str, task_id: str, request: Request,
+             user: Principal = Depends(require("READ_GRAPH"))):
+    store = _task_store(request,user,workspace_id)
+    rows = store.resolution_tasks(user.tenant_id,workspace_id,task_id)
+    if not rows:
+        raise HTTPException(404,"Task not available")
+    task,evidence,current,repo = _visible_task(request,user,rows[0])
+    from backend.app.task_service import permitted_transitions,task_repository
+    candidates = []
+    assignees = []
+    if "MANAGE_TASKS" in current.permissions:
+        scope = rows[0].get("scope_json") or sorted({item.source_id for item in evidence})
+        try:
+            _,owner_repo = task_repository(current,workspace_id,scope,request.app.state.graph_store,
+                                           getattr(request.app.state,"governance_store",None))
+        except PermissionError:
+            owner_repo = repo
+        page = owner_repo.neighborhood(task.service_id,limit=100)
+        names = {node.id:node.name or node.id for node in page.nodes if node.type=="TEAM"}
+        candidates = [{"team_id":identifier,"team_name":names[identifier]} for identifier in sorted({
+            edge.source_id for edge in page.relationships if edge.type=="OWNS" and edge.target_id==task.service_id
+            and edge.source_id in names and edge.origin in ("source_asserted","observed")})]
+        governance = getattr(request.app.state,"governance_store",None)
+        if governance is not None:
+            from backend.app.task_service import recipients_for
+            for candidate in candidates:
+                proposed = task.model_copy(update={"primary_team_id":candidate["team_id"]})
+                members = governance.read("""SELECT m.employee_id,e.display_name FROM nexus_team_memberships m
+                    JOIN nexus_employees e ON e.employee_id=m.employee_id AND e.tenant_id=m.tenant_id
+                    WHERE m.tenant_id=%s AND m.team_id=%s""", (current.tenant_id,candidate["team_id"]))
+                for member in members:
+                    subject = f"nexus:{member['employee_id']}"
+                    eligible = recipients_for(proposed.model_copy(update={"assigned_subject":subject}),evidence,current,
+                        workspace_id,request.app.state.graph_store,governance)
+                    if subject in eligible:
+                        assignees.append({"subject":subject,"name":member["display_name"],"team_id":candidate["team_id"]})
+    return {"task":task.model_dump(mode="json"),"evidence":[item.model_dump(mode="json") for item in evidence],
+            "history":store.resolution_history(task_id),"allowed_transitions":permitted_transitions(task,current),
+            "can_assign":"MANAGE_TASKS" in current.permissions,"assignment_candidates":candidates,
+            "assignee_candidates":assignees}
+
+
+class TaskUpdateBody(BaseModel):
+    status: str | None = None
+    primary_team_id: str | None = None
+    assigned_subject: str | None = None
+    reason: str = Field(min_length=3,max_length=2000)
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/tasks/{task_id}/evidence/{evidence_id}")
+def task_evidence(workspace_id: str, task_id: str, evidence_id: str, request: Request,
+                  user: Principal = Depends(require("READ_EVIDENCE"))):
+    store = _task_store(request,user,workspace_id)
+    rows = store.resolution_tasks(user.tenant_id,workspace_id,task_id)
+    if not rows:
+        raise HTTPException(404,"Evidence not available")
+    _,evidence,_,_ = _visible_task(request,user,rows[0])
+    for item in evidence:
+        if item.evidence_id==evidence_id:
+            return item.model_dump(mode="json")
+    raise HTTPException(404,"Evidence not available")
+
+
+@app.post("/api/v1/workspaces/{workspace_id}/tasks/{task_id}/updates")
+def update_task(workspace_id: str, task_id: str, body: TaskUpdateBody, request: Request,
+                user: Principal = Depends(require("READ_GRAPH"))):
+    from backend.app.resolution_models import TaskStatus
+    from backend.app.task_service import permitted_transitions, recipients_for, task_repository
+    from backend.app.resolution import problem_resolved
+    from backend.app.security import Permission
+    store = _task_store(request,user,workspace_id)
+    def change(old,row):
+        _,evidence,current,repo = _visible_task(request,user,row)
+        update,recipients = {},()
+        manager = Permission.MANAGE_TASKS in current.permissions
+        if body.primary_team_id is not None or body.assigned_subject is not None:
+            if not manager:
+                raise HTTPException(403,"Task assignment permission required")
+            if old.status in (TaskStatus.VERIFIED,TaskStatus.CLOSED):
+                raise HTTPException(409,"Verified or closed tasks cannot be reassigned without reopening the work")
+            team = body.primary_team_id or old.primary_team_id
+            if not team:
+                raise HTTPException(409,"Choose a current source-backed responsible team first")
+            scope = row.get("scope_json") or sorted({item.source_id for item in evidence})
+            try:
+                _,repo = task_repository(current,workspace_id,scope,request.app.state.graph_store,
+                                        getattr(request.app.state,"governance_store",None))
+            except PermissionError:
+                raise HTTPException(403,"Current access to the assignment evidence is required")
+            entity = repo.get_entity(team)
+            if entity is None or entity.type != "TEAM":
+                raise HTTPException(409,"Responsible team is no longer available")
+            current_ownership = repo.neighborhood(old.service_id,limit=100)
+            if not any(edge.type=="OWNS" and edge.source_id==team and edge.target_id==old.service_id
+                       and edge.origin in ("source_asserted","observed") for edge in current_ownership.relationships):
+                raise HTTPException(409,"This team no longer has current service ownership evidence")
+            owner_source = next(edge.source_id_ref for edge in current_ownership.relationships
+                if edge.type=="OWNS" and edge.source_id==team and edge.target_id==old.service_id
+                and edge.origin in ("source_asserted","observed"))
+            context = next((context for context in store.assignment_contexts(user.tenant_id,workspace_id,task_id)
+                            if owner_source in context["selected_source_ids"]),None)
+            if context is None:
+                raise HTTPException(409,"Ownership evidence needs a linked investigation with that source selected")
+            scope = context["selected_source_ids"]
+            current,repo = task_repository(current,workspace_id,scope,request.app.state.graph_store,
+                                          getattr(request.app.state,"governance_store",None))
+            if Permission.MANAGE_TASKS not in current.permissions:
+                raise HTTPException(403,"Task assignment permission is no longer available")
+            entity = repo.get_entity(team)
+            current_ownership = repo.neighborhood(old.service_id,limit=100)
+            from backend.app.agent.provenance import capture
+            registry = {item.evidence_id:item for item in evidence}
+            direct = [edge for edge in current_ownership.relationships if edge.type=="OWNS"
+                      and edge.source_id==team and edge.target_id==old.service_id
+                      and edge.origin in ("source_asserted","observed")]
+            if entity is None or not direct:
+                raise HTTPException(409,"Current ownership could not be revalidated in the linked investigation scope")
+            refs = capture(context["run_id"],"resolution.assignment",
+                {"entity":entity.model_dump(mode="json"),"relationships":[edge.model_dump(mode="json") for edge in direct]},
+                repo.graph_revision(),frozenset(scope),registry)
+            decision = old.finding.ownership.model_copy(update={"primary_team_id":team,
+                "primary_team_name":entity.name or team,"candidate_team_ids":tuple(sorted(set((*old.finding.ownership.candidate_team_ids,team)))),
+                "evidence_ids":tuple(dict.fromkeys((*old.finding.ownership.evidence_ids,*refs))),
+                "status":"VERIFIED","explanation":"Administrator selected a current directly evidenced service owner."})
+            evidence = tuple(registry.values())
+            row["evidence_json"] = [item.model_dump(mode="json") for item in evidence]
+            update.update(primary_team_id=team,primary_team_name=entity.name or team,
+                assignment_reason=body.reason,assignment_version=old.assignment_version+1,
+                assigned_subject=(body.assigned_subject or None) if body.assigned_subject is not None else old.assigned_subject,
+                evidence_ids=tuple(registry),finding=old.finding.model_copy(update={"ownership":decision}))
+            if team==old.primary_team_id and update["assigned_subject"]==old.assigned_subject and old.status!=TaskStatus.OPEN:
+                if body.status is None:
+                    raise HTTPException(409,"This assignment is unchanged; no duplicate notification was created")
+                update = {"evidence_ids":tuple(registry),"finding":old.finding.model_copy(update={"ownership":decision})}
+            if old.status == TaskStatus.OPEN:
+                update["status"] = TaskStatus.ASSIGNED
+        if body.status is not None:
+            try:
+                desired = TaskStatus(body.status)
+            except ValueError:
+                raise HTTPException(422,"Unknown task status")
+            if desired not in permitted_transitions(old,current):
+                raise HTTPException(409,"This task transition is not permitted")
+            if desired == TaskStatus.ASSIGNED and not update.get("primary_team_id",old.primary_team_id):
+                raise HTTPException(409,"Choose an evidenced responsible team first")
+            if desired == TaskStatus.VERIFIED:
+                scope = row.get("scope_json") or sorted({item.source_id for item in evidence})
+                try:
+                    current,repo = task_repository(current,workspace_id,scope,request.app.state.graph_store,
+                                                  getattr(request.app.state,"governance_store",None))
+                except PermissionError:
+                    raise HTTPException(409,"Independent verification needs access to all selected investigation sources")
+                manager = Permission.MANAGE_TASKS in current.permissions
+                if not manager or not problem_resolved(old,repo):
+                    raise HTTPException(409,"Independent verification still finds the problem or lacks current evidence")
+                update["resolution_verification"] = "VERIFIED"
+            elif desired == TaskStatus.IN_PROGRESS:
+                update["resolution_verification"] = "NOT_CHECKED"
+            update["status"] = desired
+        if not update:
+            raise HTTPException(422,"Choose a status or assignment change")
+        task = old.model_copy(update=update)
+        if "assignment_version" in update:
+            recipients = recipients_for(task,evidence,current,workspace_id,request.app.state.graph_store,
+                                        getattr(request.app.state,"governance_store",None))
+            if task.assigned_subject and task.assigned_subject not in recipients:
+                raise HTTPException(409,"The selected person lacks current access to this task")
+        return task,{"from_status":old.status.value,"to_status":task.status.value,
+                     "team_id":task.primary_team_id,"reason":body.reason,
+                     "assigned_subject":task.assigned_subject,
+                     "assignment_evidence_ids":list(set(task.evidence_ids)-set(old.evidence_ids)),
+                     "resolution_verification":task.resolution_verification},recipients
+    try:
+        task = store.change_resolution_task(tenant_id=user.tenant_id,workspace_id=workspace_id,
+                                           task_id=task_id,actor=user.subject,change=change)
+    except LookupError:
+        raise HTTPException(404,"Task not available")
+    return task.model_dump(mode="json")
+
+
+@app.get("/api/v1/workspaces/{workspace_id}/notifications")
+def task_notifications(workspace_id: str, request: Request,
+                       user: Principal = Depends(require("READ_GRAPH"))):
+    store = _task_store(request,user,workspace_id)
+    items = []
+    for notification in store.resolution_notifications(user.tenant_id,workspace_id,user.subject):
+        rows = store.resolution_tasks(user.tenant_id,workspace_id,notification["task_id"])
+        if not rows:
+            continue
+        try:
+            task,_,_,_ = _visible_task(request,user,rows[0])
+        except HTTPException:
+            continue
+        items.append({**notification,"title":task.title,"team_id":task.primary_team_id,
+                      "team_name":task.primary_team_name,"priority":task.priority,"project_id":task.project_id})
+    return {"items":items,"unread":sum(item["read_at"] is None for item in items)}
+
+
+@app.post("/api/v1/workspaces/{workspace_id}/notifications/{notification_id}/read")
+def read_task_notification(workspace_id: str, notification_id: str, request: Request,
+                           user: Principal = Depends(require("READ_GRAPH"))):
+    store = _task_store(request,user,workspace_id)
+    permitted = task_notifications(workspace_id,request,user)["items"]
+    if not any(item["notification_id"]==notification_id for item in permitted):
+        raise HTTPException(404,"Notification not available")
+    store.read_resolution_notification(user.tenant_id,workspace_id,user.subject,notification_id)
+    return {"status":"READ"}
+
+
+@app.post("/api/v1/workspaces/{workspace_id}/investigations/{run_id}/tasks")
+def generate_tasks(workspace_id: str, run_id: str, request: Request,
+                   user: Principal = Depends(require("MANAGE_TASKS"))):
+    from backend.app.task_service import create_tasks
+    store = _task_store(request,user,workspace_id)
+    result = InvestigationResult.model_validate(get_investigation(workspace_id,run_id,request,user))
+    updated = create_tasks(result,user,workspace_id,store,request.app.state.graph_store,
+                           getattr(request.app.state,"governance_store",None))
+    return updated.model_dump(mode="json")
 
 
 @app.get("/api/v1/nexus/session")

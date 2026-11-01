@@ -174,6 +174,7 @@ def test_budget_exhaustion_stops_additional_model_calls(tool_registry, skill_reg
     tracker.configure("tenant-1", limit=1080)
     gateway = ModelGateway(provider, _router(), budget_tracker=tracker)
     exec_context = _exec_context(limits=RuntimeLimits(max_llm_calls=10, max_tool_calls=10,
+                                                      max_output_tokens_per_call=1024,
                                                       overall_timeout_seconds=30, request_budget_key="tenant-1"))
     request = InvestigationRequest(question="whatever")
 

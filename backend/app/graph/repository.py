@@ -96,6 +96,19 @@ class GraphRepository:
     def graph_revision(self) -> int:
         return self.store.read(self._current_revision_in_tx)
 
+    def available_source_ids(self, source_ids: frozenset[str]) -> frozenset[str]:
+        """Resolve exact requested IDs within this workspace and current read ACL."""
+        def work(tx):
+            rows = tx.run("""
+                MATCH (s:SourceRecord {tenant_id:$tenant, workspace_id:$workspace})
+                WHERE s.source_id IN $requested
+                  AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                RETURN DISTINCT s.source_id AS source_id
+                """, **self._params(), requested=sorted(source_ids))
+            return frozenset(row["source_id"] for row in rows)
+        return self.store.read(work)
+
     def _resolve(self, entity_id: str, assertions: list[dict[str, Any]], active: bool = True) -> Entity:
         values: dict[str, Any] = {}
         conflicts: dict[str, list[str]] = {}
@@ -125,7 +138,8 @@ class GraphRepository:
                 authority[field] = verdict.model_dump(mode="json")
         return Entity(id=entity_id, type=values["type"], name=values["name"],
                       description=values["description"], active=active, conflicts=conflicts,
-                      authority=authority)
+                      authority=authority, provenance=[{**claim, "entity_id": entity_id} for claim in assertions]
+                      if self.can_evidence else [])
 
     def _relationship(self, rel, source_id: str, target_id: str) -> Relationship:
         return Relationship(
@@ -143,7 +157,8 @@ class GraphRepository:
     def _claim(row) -> dict[str, Any]:
         assertion = row["a"]
         return dict(type=assertion.get("type"), name=assertion.get("name"),
-                    description=assertion.get("description"), source_id=row["source_id"])
+                      description=assertion.get("description"), source_id=row["source_id"],
+                      record_id=row["record_id"], title=row["title"], uri=row["uri"], revision=row["revision"])
 
     def _entity_in_tx(self, tx, entity_id: str, history: bool = False) -> Entity | None:
         key = scoped_key(self.tenant_id, self.workspace_id, entity_id)
@@ -156,8 +171,9 @@ class GraphRepository:
               AND s.tenant_id=$tenant AND s.workspace_id=$workspace
               AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
               AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-              AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
-            RETURN e.public_id AS id, a, s.active AS source_active, s.source_id AS source_id
+              AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+            RETURN e.public_id AS id, a, s.active AS source_active, s.source_id AS source_id,
+                   s.record_id AS record_id, s.title AS title, s.uri AS uri, s.revision AS revision
             """, key=key, history=history, **self._params()))
         if not rows:
             return None
@@ -183,7 +199,7 @@ class GraphRepository:
                       -[a:ASSERTS]->(e:Entity {key:$key, tenant_id:$tenant, workspace_id:$workspace})
                 WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s, a ORDER BY s.source_id, s.record_id, a.observed_at DESC LIMIT $fetch
                 """, key=key, **self._params(), fetch=limit + 1))
             items = []
@@ -194,6 +210,7 @@ class GraphRepository:
                                and (not a.get("valid_from") or a["valid_from"] <= now)
                                and (not a.get("valid_to") or a["valid_to"] > now))
                 items.append({
+                    "entity_id": entity_id,
                     "source_id": s["source_id"], "record_id": s["record_id"],
                     "type": a.get("type"), "name": a.get("name"),
                     "description": a.get("description"), "current": current,
@@ -364,8 +381,10 @@ class GraphRepository:
                   AND (a.valid_to IS NULL OR a.valid_to > $as_of)
                   AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
-                WITH e, collect({type:a.type, name:a.name, description:a.description, source_id:s.source_id}) AS claims
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                WITH e, collect({type:a.type, name:a.name, description:a.description,
+                                 source_id:s.source_id, record_id:s.record_id, title:s.title,
+                                 uri:s.uri, revision:s.revision}) AS claims
                 WHERE toLower(e.public_id) CONTAINS $needle
                    OR any(claim IN claims WHERE toLower(claim.name) CONTAINS $needle)
                 RETURN e.public_id AS id, claims
@@ -404,7 +423,7 @@ class GraphRepository:
                     WHERE $allow_all OR size(source.acl_subjects)=0 OR $subject IN source.acl_subjects
                   }
                   AND ($allow_all OR size(coalesce(r.acl_subjects, []))=0 OR $subject IN r.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR r.source_id IN $authorized_sources)
+                  AND ($authorized_sources IS NULL OR r.source_id IN $authorized_sources)
                 RETURN startNode(r).public_id AS source_id, endNode(r).public_id AS target_id, r
                 ORDER BY r.active DESC, type(r), r.key LIMIT $fetch
                 """, key=key, **self._params(), history=include_history,
@@ -437,25 +456,26 @@ class GraphRepository:
         return self.neighborhood(entity_id, limit=limit, include_history=include_history,
                                  reverse_only=True, reverse_relation_type="BLOCKS")
 
-    def relationship(self, relation_id: str) -> Relationship | None:
+    def relationship(self, relation_id: str, include_history: bool = False) -> Relationship | None:
         def work(tx):
             row = tx.run("""
                 MATCH (a:Entity {tenant_id:$tenant, workspace_id:$workspace})-[r]->
                       (b:Entity {tenant_id:$tenant, workspace_id:$workspace})
-                WHERE r.key=$key AND r.active=true AND r.tenant_id=$tenant AND r.workspace_id=$workspace
-                  AND (r.valid_from IS NULL OR r.valid_from <= $as_of)
-                  AND (r.valid_to IS NULL OR r.valid_to > $as_of)
+                WHERE r.key=$key AND r.tenant_id=$tenant AND r.workspace_id=$workspace
+                  AND ($history OR (r.active=true AND (r.valid_from IS NULL OR r.valid_from <= $as_of)
+                  AND (r.valid_to IS NULL OR r.valid_to > $as_of)))
                   AND EXISTS {
-                    MATCH (s:SourceRecord {key:r.record_key, tenant_id:$tenant, workspace_id:$workspace, active:true})
-                    WHERE $allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects
+                    MATCH (s:SourceRecord {key:r.record_key, tenant_id:$tenant, workspace_id:$workspace})
+                    WHERE ($history OR s.active=true)
+                      AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   }
                   AND ($allow_all OR size(coalesce(r.acl_subjects, []))=0 OR $subject IN r.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR r.source_id IN $authorized_sources)
+                  AND ($authorized_sources IS NULL OR r.source_id IN $authorized_sources)
                 RETURN a.public_id AS source_id, b.public_id AS target_id, r
-                """, key=relation_id, **self._params()).single()
+                """, key=relation_id, history=include_history, **self._params()).single()
             if row is None:
                 return None
-            if self._entity_in_tx(tx, row["source_id"]) is None or self._entity_in_tx(tx, row["target_id"]) is None:
+            if self._entity_in_tx(tx, row["source_id"], history=include_history) is None or self._entity_in_tx(tx, row["target_id"], history=include_history) is None:
                 return None
             return self._relationship(row["r"], row["source_id"], row["target_id"])
         return self.store.read(work)
@@ -506,7 +526,7 @@ class GraphRepository:
                       -[a:ASSERTS {active:true}]->(e:Entity {key:$key, tenant_id:$tenant, workspace_id:$workspace})
                 WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
                   AND ($allow_all OR size(coalesce(a.acl_subjects, []))=0 OR $subject IN a.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                   AND (a.valid_from IS NULL OR a.valid_from <= $as_of)
                   AND (a.valid_to IS NULL OR a.valid_to > $as_of)
                 RETURN DISTINCT s ORDER BY s.source_id, s.record_id LIMIT $fetch
@@ -524,23 +544,24 @@ class GraphRepository:
             rows = list(tx.run("""
                 MATCH (s:SourceRecord {tenant_id:$tenant, workspace_id:$workspace, active:true})
                 WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s.source_id AS id, count(s) AS records ORDER BY id LIMIT $fetch
                 """, **self._params(), fetch=limit + 1))
             return {"items": [dict(row) for row in rows[:limit]], "truncated": len(rows) > limit}
         return self.store.read(work)
 
-    def source_record(self, source_id: str, record_id: str) -> dict[str, Any] | None:
+    def source_record(self, source_id: str, record_id: str, include_history: bool = False) -> dict[str, Any] | None:
         if not self.can_evidence:
             raise PermissionError("Evidence permission required")
         key = scoped_key(self.tenant_id, self.workspace_id, source_id, record_id)
         def work(tx):
             row = tx.run("""
-                MATCH (s:SourceRecord {key:$key, tenant_id:$tenant, workspace_id:$workspace, active:true})
-                WHERE ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
-                  AND ($allow_all OR $authorized_sources IS NULL OR s.source_id IN $authorized_sources)
+                MATCH (s:SourceRecord {key:$key, tenant_id:$tenant, workspace_id:$workspace})
+                WHERE ($history OR s.active=true)
+                  AND ($allow_all OR size(s.acl_subjects)=0 OR $subject IN s.acl_subjects)
+                  AND ($authorized_sources IS NULL OR s.source_id IN $authorized_sources)
                 RETURN s
-                """, key=key, **self._params()).single()
+                """, key=key, history=include_history, **self._params()).single()
             if row is None:
                 return None
             s = row["s"]

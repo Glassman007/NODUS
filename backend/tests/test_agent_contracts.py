@@ -32,11 +32,20 @@ def test_agent_execution_context_rejects_duplicate_skill_ids():
                              ApprovedSkill(skill_id="verify-evidence", version="2.0.0")))
 
 
-def test_agent_execution_context_defaults_are_small_and_explicit():
+def test_agent_execution_context_defaults_are_maximum_and_explicit():
     context = AgentExecutionContext(
-        authorization=_auth(), run_id="r1",
-        approved_skills=(ApprovedSkill(skill_id="verify-evidence", version="1.0.0"),))
-    assert context.limits.max_llm_calls == 6  # a small default, not ADK's unrestricted 500
+        authorization=_auth(),
+        run_id="r1",
+        approved_skills=(
+            ApprovedSkill(skill_id="verify-evidence", version="1.0.0"),
+        ),
+    )
+
+    assert context.limits.max_llm_calls == 50
+    assert context.limits.max_tool_calls == 100
+    assert context.limits.max_output_tokens_per_call == 65536
+    assert context.limits.max_total_tokens_per_call == 200000
+    assert context.limits.overall_timeout_seconds == 600.0
     assert context.model_role == ModelRole.DEFAULT
 
 

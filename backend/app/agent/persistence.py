@@ -15,10 +15,10 @@ pausing for access does not duplicate it; approving a request already makes
 ``refresh_principal_source_ids``/``refresh_authorization`` see the new grant
 on the very next resume attempt, with zero changes needed here.
 
-Only structured references and compact, already-validated ``SpecialistResult``
-dumps are ever persisted here — never API keys/bearer tokens, never a raw
-model conversation, never unrestricted source records. A ``SpecialistResult``
-already carries only evidence *references* (ids), not evidence content.
+Coordinator checkpoints retain compact ``SpecialistResult`` references. Single-agent
+reports additionally retain bounded, source-scoped retrieval snapshots and their
+hashes in an append-only report row. API keys, bearer tokens, raw model conversations,
+and unrestricted source records are never persisted.
 ``principal_subject`` is the run's immutable original creator (ND-14B section
 4); ``assignee_subject`` is the current owner, transferred only through
 ``request_handoff``/``decide_handoff``, never by resuming or checkpointing.
@@ -37,6 +37,38 @@ from psycopg.rows import dict_row
 from backend.app.agent.contracts import CoordinatorBudget, SpecialistResult, SpecialistRole
 
 SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS nodus_investigation_reports (
+        run_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        principal_subject TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        selected_source_ids JSONB NOT NULL,
+        result_json JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    """CREATE TABLE IF NOT EXISTS nodus_remediation_tasks (
+        task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, status TEXT NOT NULL, task_json JSONB NOT NULL,
+        evidence_json JSONB NOT NULL, created_by TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS nodus_active_problem_task ON nodus_remediation_tasks
+        (tenant_id,workspace_id,fingerprint) WHERE status NOT IN ('VERIFIED','CLOSED')""",
+    "ALTER TABLE nodus_remediation_tasks ADD COLUMN IF NOT EXISTS scope_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+    """CREATE TABLE IF NOT EXISTS nodus_task_investigations (
+        task_id TEXT NOT NULL REFERENCES nodus_remediation_tasks(task_id),
+        run_id TEXT NOT NULL REFERENCES nodus_investigation_reports(run_id), PRIMARY KEY(task_id,run_id))""",
+    """CREATE TABLE IF NOT EXISTS nodus_task_history (
+        event_id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES nodus_remediation_tasks(task_id),
+        actor TEXT NOT NULL, event TEXT NOT NULL, details JSONB NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
+    """CREATE TABLE IF NOT EXISTS nodus_task_notifications (
+        notification_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES nodus_remediation_tasks(task_id),
+        tenant_id TEXT NOT NULL, workspace_id TEXT NOT NULL, recipient TEXT NOT NULL,
+        assignment_version INTEGER NOT NULL, read_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(task_id,recipient,assignment_version))""",
     """
     CREATE TABLE IF NOT EXISTS nodus_investigation_runs (
         run_id TEXT PRIMARY KEY,
@@ -150,6 +182,139 @@ class InvestigationStore:
         if not dsn:
             raise ValueError("A PostgreSQL DSN is required")
         self.dsn = dsn
+
+    def save_report(self, *, result, tenant_id: str, workspace_id: str,
+                    principal_subject: str, objective: str, selected_source_ids: tuple[str, ...]) -> None:
+        """Append-only run snapshot, including the bounded evidence registry.
+
+        A repeated run ID cannot replace the owner's original report or evidence.
+        Authentication credentials and model conversation are never stored.
+        """
+        if any(item.run_id != result.run_id or item.source_id not in selected_source_ids
+               for item in result.evidence_registry):
+            raise ValueError("Evidence snapshot exceeds persisted investigation scope")
+        with self._transaction() as cur:
+            cur.execute("""
+                INSERT INTO nodus_investigation_reports
+                (run_id, tenant_id, workspace_id, principal_subject, objective, selected_source_ids, result_json)
+                VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+                ON CONFLICT (run_id) DO NOTHING
+                """, (result.run_id, tenant_id, workspace_id, principal_subject, objective,
+                      json.dumps(selected_source_ids), result.model_dump_json()))
+
+    def owned_reports(self, *, tenant_id: str, workspace_id: str,
+                      principal_subject: str, run_id: str | None = None) -> list[dict]:
+        with self._transaction() as cur:
+            cur.execute("""
+                SELECT run_id, objective, selected_source_ids, result_json, created_at
+                FROM nodus_investigation_reports
+                WHERE tenant_id=%s AND workspace_id=%s AND principal_subject=%s
+                  AND (%s::text IS NULL OR run_id=%s)
+                ORDER BY created_at DESC LIMIT 100
+                """, (tenant_id, workspace_id, principal_subject, run_id, run_id))
+            return list(cur.fetchall())
+
+    def resolution_tasks(self, tenant_id: str, workspace_id: str, task_id: str | None = None) -> list[dict]:
+        with self._transaction() as cur:
+            cur.execute("""SELECT * FROM nodus_remediation_tasks WHERE tenant_id=%s AND workspace_id=%s
+                AND (%s::text IS NULL OR task_id=%s) ORDER BY updated_at DESC LIMIT 200""",
+                (tenant_id, workspace_id, task_id, task_id))
+            return list(cur.fetchall())
+
+    def create_resolution_task(self, *, task, evidence, tenant_id, workspace_id, actor, fingerprint,
+                               recipients: tuple[str, ...], selected_source_ids: tuple[str,...] = ()):
+        from backend.app.resolution_models import RemediationTask
+        run_id = task.investigation_id
+        with self._transaction() as cur:
+            cur.execute("""INSERT INTO nodus_remediation_tasks
+                (task_id,tenant_id,workspace_id,fingerprint,status,task_json,evidence_json,created_by,scope_json)
+                VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s::jsonb)
+                ON CONFLICT (tenant_id,workspace_id,fingerprint) WHERE status NOT IN ('VERIFIED','CLOSED')
+                DO NOTHING RETURNING task_id""", (task.task_id,tenant_id,workspace_id,fingerprint,task.status.value,
+                    task.model_dump_json(),json.dumps([item.model_dump(mode="json") for item in evidence]),actor,json.dumps(selected_source_ids)))
+            created = cur.fetchone() is not None
+            if not created:
+                cur.execute("""SELECT task_json,scope_json FROM nodus_remediation_tasks
+                    WHERE tenant_id=%s AND workspace_id=%s AND fingerprint=%s
+                      AND status NOT IN ('VERIFIED','CLOSED') FOR UPDATE""", (tenant_id,workspace_id,fingerprint))
+                existing = cur.fetchone()
+                task = RemediationTask.model_validate(existing["task_json"])
+                combined = sorted(set(existing["scope_json"]) | set(selected_source_ids))
+                cur.execute("UPDATE nodus_remediation_tasks SET scope_json=%s::jsonb WHERE task_id=%s",
+                            (json.dumps(combined),task.task_id))
+            if created:
+                cur.execute("INSERT INTO nodus_task_history(task_id,actor,event,details) VALUES (%s,%s,%s,%s::jsonb)",
+                    (task.task_id,actor,"CREATED",json.dumps({"status":task.status.value,"team_id":task.primary_team_id})))
+                self._notify(cur,task,tenant_id,workspace_id,recipients)
+            cur.execute("INSERT INTO nodus_task_investigations(task_id,run_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                        (task.task_id,run_id))
+            return task
+
+    def task_report(self, tenant_id, workspace_id, run_id):
+        with self._transaction() as cur:
+            cur.execute("""SELECT run_id,objective,selected_source_ids,result_json,created_at
+                FROM nodus_investigation_reports WHERE tenant_id=%s AND workspace_id=%s AND run_id=%s""",
+                (tenant_id,workspace_id,run_id))
+            return cur.fetchone()
+
+    def tasks_for_investigation(self, tenant_id, workspace_id, run_id):
+        with self._transaction() as cur:
+            cur.execute("""SELECT t.* FROM nodus_remediation_tasks t JOIN nodus_task_investigations i USING(task_id)
+                WHERE t.tenant_id=%s AND t.workspace_id=%s AND i.run_id=%s""", (tenant_id,workspace_id,run_id))
+            return list(cur.fetchall())
+
+    def assignment_contexts(self, tenant_id, workspace_id, task_id):
+        with self._transaction() as cur:
+            cur.execute("""SELECT r.run_id,r.selected_source_ids FROM nodus_investigation_reports r
+                JOIN nodus_task_investigations i ON i.run_id=r.run_id
+                WHERE r.tenant_id=%s AND r.workspace_id=%s AND i.task_id=%s ORDER BY r.created_at DESC""",
+                (tenant_id,workspace_id,task_id))
+            return list(cur.fetchall())
+
+    @staticmethod
+    def _notify(cur, task, tenant_id, workspace_id, recipients):
+        for recipient in set(recipients):
+            cur.execute("""INSERT INTO nodus_task_notifications
+                (notification_id,task_id,tenant_id,workspace_id,recipient,assignment_version)
+                VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(task_id,recipient,assignment_version) DO NOTHING""",
+                (str(uuid4()),task.task_id,tenant_id,workspace_id,recipient,task.assignment_version))
+
+    def change_resolution_task(self, *, tenant_id, workspace_id, task_id, actor, change):
+        """The callback authorizes and validates against the row locked in this transaction."""
+        from backend.app.resolution_models import RemediationTask
+        with self._transaction() as cur:
+            cur.execute("SELECT * FROM nodus_remediation_tasks WHERE tenant_id=%s AND workspace_id=%s AND task_id=%s FOR UPDATE",
+                        (tenant_id,workspace_id,task_id))
+            row = cur.fetchone()
+            if row is None:
+                raise LookupError("Task not available")
+            old = RemediationTask.model_validate(row["task_json"])
+            task, details, recipients = change(old, row)
+            cur.execute("UPDATE nodus_remediation_tasks SET status=%s,task_json=%s::jsonb,evidence_json=%s::jsonb,updated_at=now() WHERE task_id=%s",
+                        (task.status.value,task.model_dump_json(),json.dumps(row["evidence_json"]),task_id))
+            cur.execute("INSERT INTO nodus_task_history(task_id,actor,event,details) VALUES (%s,%s,%s,%s::jsonb)",
+                        (task_id,actor,"UPDATED",json.dumps(details)))
+            self._notify(cur,task,tenant_id,workspace_id,recipients)
+            return task
+
+    def resolution_history(self, task_id):
+        with self._transaction() as cur:
+            cur.execute("SELECT actor,event,details,occurred_at FROM nodus_task_history WHERE task_id=%s ORDER BY event_id", (task_id,))
+            return list(cur.fetchall())
+
+    def resolution_notifications(self, tenant_id, workspace_id, recipient):
+        with self._transaction() as cur:
+            cur.execute("""SELECT notification_id,task_id,read_at,created_at FROM nodus_task_notifications
+                WHERE tenant_id=%s AND workspace_id=%s AND recipient=%s ORDER BY created_at DESC LIMIT 100""",
+                (tenant_id,workspace_id,recipient))
+            return list(cur.fetchall())
+
+    def read_resolution_notification(self, tenant_id, workspace_id, recipient, notification_id):
+        with self._transaction() as cur:
+            cur.execute("""UPDATE nodus_task_notifications SET read_at=COALESCE(read_at,now())
+                WHERE tenant_id=%s AND workspace_id=%s AND recipient=%s AND notification_id=%s RETURNING task_id""",
+                (tenant_id,workspace_id,recipient,notification_id))
+            return cur.fetchone()
 
     def start(self) -> None:
         with psycopg.connect(self.dsn, autocommit=True, connect_timeout=self.CONNECT_TIMEOUT_SECONDS) as conn:

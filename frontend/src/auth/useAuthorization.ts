@@ -1,3 +1,5 @@
+import { ApiError, responseError } from "./errors";
+import { INVESTIGATION_TIMEOUT_MS } from "../investigations/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthorizationError, resolveAuthorization } from "./api";
 import type { AuthorizationContext, ProjectScope } from "./models";
@@ -133,32 +135,56 @@ export function useAuthorization() {
   ): Promise<T> {
     if (!credential.current || signal.aborted)
       throw new Error("Session is no longer active.");
-    const response = await fetch(`/api/v1/${path}`, {
-      method: body === undefined ? "GET" : "POST",
-      signal,
-      headers: {
-        Authorization: `Bearer ${credential.current}`,
-        "Content-Type": "application/json",
-      },
-      cache: "no-store",
-      credentials: "omit",
-      redirect: "error",
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
-    if (signal.aborted) throw new DOMException("Request aborted", "AbortError");
-    if (response.status === 401) {
-      reset();
-      throw new Error("Session expired. Enter your token again.");
+    const investigation =
+      body !== undefined && path.endsWith("/investigations");
+    const timeout = AbortSignal.timeout(
+      investigation ? INVESTIGATION_TIMEOUT_MS : 30_000,
+    );
+    const requestSignal = AbortSignal.any([signal, timeout]);
+    let response: Response;
+    try {
+      response = await fetch(`/api/v1/${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        signal: requestSignal,
+        headers: {
+          Authorization: `Bearer ${credential.current}`,
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        credentials: "omit",
+        redirect: "error",
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+    } catch (reason) {
+      if (signal.aborted) throw reason;
+      if (timeout.aborted)
+        throw new ApiError(
+          "Backend processing timed out. The backend may still be running; no automatic retry was made.",
+          0,
+          "TIMEOUT",
+        );
+      throw new ApiError(
+        "Network interruption. The backend may still be processing your request. Check the connection before submitting again.",
+      );
     }
-    if (response.status === 403)
-      throw new Error(
-        "Permission denied. Your current access does not allow this action.",
+    if (signal.aborted) throw new DOMException("Request aborted", "AbortError");
+    if (!response.ok) {
+      const error = await responseError(response);
+      if (!signal.aborted && response.status === 401) {
+        reset();
+        setError(error.message);
+      }
+      throw error;
+    }
+    try {
+      return (await response.json()) as T;
+    } catch {
+      throw new ApiError(
+        "The backend returned invalid JSON. No result has been accepted.",
+        response.status,
+        "INVALID_RESPONSE",
       );
-    if (!response.ok)
-      throw new Error(
-        `Request unavailable (HTTP ${response.status}). Check your access and service configuration, then retry.`,
-      );
-    return response.json() as Promise<T>;
+    }
   }
 
   return {

@@ -56,6 +56,7 @@ export const resolveAuthorization: AuthorizationResolver = async (token, signal)
     // The API exposes project IDs, not display names. Never substitute a client-side catalog.
     projects: [...new Set(scope.project_ids)].map(id => ({ id, name: id })),
     permissions: principal.permissions,
+    ...(isTextList(scope.source_ids) ? { sourceIds: [...new Set(scope.source_ids)] } : {}),
     capabilities: {
       requestAccess: scope.capabilities.request_access === true,
       reviewAccessRequests: scope.capabilities.review_access_requests === true,

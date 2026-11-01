@@ -113,6 +113,33 @@ class GatewayLlm(BaseLlm):
                               error_message="Model calls stopped earlier in this run; not retrying.")
             return
 
+        # Conversation history contains earlier retrievals. Refresh before replaying
+        # it, not only when executing a new tool, or revocation would be bypassed.
+        from backend.app.agent.tool_bridge import refresh_authorization
+        from backend.app.governance.identity import recipient_authorized_sources
+        from backend.app.security import Permission
+        original = run_state.exec_context.authorization
+        current = refresh_authorization(original, run_state.tool_executor)
+        scope = recipient_authorized_sources(current)
+        dependencies = set(original.selected_source_ids if original.selected_source_ids is not None
+                           else original.principal.source_ids) | run_state.consumed_source_ids | {
+            item.source_id for item in run_state.evidence_registry.values()}
+        records_available = True
+        if run_state.tool_executor.dependencies.graph_store is not None:
+            from backend.app.agent.verifier import retrievals_accessible
+            from backend.app.tools.graph_tools import _repository
+            try:
+                records_available = retrievals_accessible(run_state, _repository(current, run_state.tool_executor.dependencies))
+            except Exception:
+                records_available = False
+        if not current.principal.permits(Permission.EXECUTE_TOOL) or (
+                not original.permissions <= current.permissions) or (
+                scope is not None and not dependencies <= scope) or not records_available:
+            run_state.hard_stopped_reason = "SOURCE_RESTRICTED"
+            yield LlmResponse(error_code="SOURCE_RESTRICTED",
+                              error_message="Investigation access changed; model history cannot be replayed.")
+            return
+
         self._maybe_append_user_content(llm_request)
 
         turns = []
@@ -126,7 +153,7 @@ class GatewayLlm(BaseLlm):
         limits = run_state.exec_context.limits
 
         request = ModelRequest(
-            context=run_state.exec_context.authorization,
+            context=current,
             correlation_id=f"{run_state.exec_context.run_id}:{run_state.llm_calls}",
             role=run_state.exec_context.model_role,
             prompt="",

@@ -54,6 +54,10 @@ INACCESSIBLE, INCOMPLETE or an empty result, say so plainly — never guess or i
 5. Never claim to have verified something a tool did not confirm. Never resolve a conflict \
 yourself — report CONFLICTING/unresolved/no_rule exactly as the tool returned it.
 6. Never claim broader access than the tools actually granted you.
+Never claim that remediation tasks were assigned or notifications sent. Those actions
+are decided separately by the server after evidence and ownership verification.
+Use only server-returned evidence_ids for citations. A graph projection establishes
+the exact typed relationship only; explain inferred effects separately.
 7. When you are done, or when you cannot make further progress, give a concise final answer \
 in plain text summarizing what you found, citing entity/relationship ids and evidence \
 references you actually saw in tool results, and naming any unresolved conflicts or \
@@ -200,7 +204,7 @@ def _build_result(request: InvestigationRequest, exec_context: AgentExecutionCon
         error_message = f"Investigation exceeded its {exec_context.limits.max_llm_calls}-call LLM turn limit."
         summary = summary or "The investigation did not reach a final answer within its bounded turn limit."
     elif run_state.hard_stopped_reason is not None:
-        error_message = f"Model call stopped: {run_state.hard_stopped_reason}"
+        error_message = f"x: {run_state.hard_stopped_reason}"
         if run_state.hard_stopped_reason == ModelErrorCategory.AUTHORIZATION_DENIED.value:
             status = InvestigationStatus.BLOCKED
         elif run_state.hard_stopped_reason in _RETRYABLE_CATEGORIES:
@@ -222,10 +226,66 @@ def _build_result(request: InvestigationRequest, exec_context: AgentExecutionCon
     else:
         status = InvestigationStatus.COMPLETE
 
+    from backend.app.agent.provenance import narrative_findings
+    from backend.app.agent.verifier import verify_snapshots, retrievals_accessible
+    from backend.app.agent.tool_bridge import refresh_authorization
+    from backend.app.tools.graph_tools import _repository
+    if run_state.hard_stopped_reason == "SOURCE_RESTRICTED":
+        return InvestigationResult(run_id=exec_context.run_id, status=InvestigationStatus.BLOCKED,
+            summary="Investigation access changed; report content is unavailable.",
+            verification_status="SOURCE_RESTRICTED", model_usage=model_usage)
+    verified = ()
+    if hasattr(run_state.tool_executor, "dependencies"):
+        from backend.app.governance.identity import recipient_authorized_sources
+        from backend.app.security import Permission
+        current_auth = refresh_authorization(exec_context.authorization, run_state.tool_executor)
+        current_scope = recipient_authorized_sources(current_auth)
+        original = exec_context.authorization
+        dependencies = set(original.selected_source_ids if original.selected_source_ids is not None
+                           else original.principal.source_ids) | run_state.consumed_source_ids
+        if not original.permissions <= current_auth.permissions or (
+                current_scope is not None and not dependencies <= current_scope):
+            return InvestigationResult(run_id=exec_context.run_id, status=InvestigationStatus.BLOCKED,
+                summary="Investigation access changed; report content is unavailable.",
+                verification_status="SOURCE_RESTRICTED", model_usage=model_usage)
+        if run_state.tool_executor.dependencies.graph_store is not None:
+            try:
+                available = retrievals_accessible(run_state, _repository(current_auth, run_state.tool_executor.dependencies))
+            except Exception:
+                available = False
+            if not available:
+                return InvestigationResult(run_id=exec_context.run_id, status=InvestigationStatus.BLOCKED,
+                    summary="Investigation evidence changed or became inaccessible; report content is unavailable.",
+                    verification_status="SOURCE_RESTRICTED", model_usage=model_usage)
+        if run_state.evidence_registry:
+            verified = verify_snapshots(run_state.evidence_registry,
+                                        _repository(current_auth, run_state.tool_executor.dependencies),
+                                        tuple(run_state.retrieved_paths))
+    structured = (*verified, *narrative_findings(summary, run_state.evidence_registry))
+    source_usage = {}
+    verification_summary = {}
+    for finding in structured:
+        label = finding.verification_status
+        verification_summary[label] = verification_summary.get(label, 0) + 1
+    for item in run_state.evidence_registry.values():
+        source_usage[item.source_id] = source_usage.get(item.source_id, 0) + 1
     return InvestigationResult(
         run_id=exec_context.run_id,
         status=status,
+        starting_entity_id=request.entity_id if request.entity_id in run_state.observed_entity_ids else run_state.primary_entity_id,
         summary=summary[:4000],
+        evidence_registry=tuple(run_state.evidence_registry.values()),
+        structured_findings=structured,
+        verification_status="PARTIALLY_VERIFIED" if any(
+            finding.verification_status == "SUPPORTED" for finding in verified) else "UNVERIFIED",
+        source_usage=source_usage,
+        restricted_retrieval_attempts=sum(record.status == "FORBIDDEN" for record in run_state.tool_call_records)
+            + run_state.provenance_rejections,
+        verification_summary=verification_summary,
+        selected_source_ids=exec_context.authorization.selected_source_ids or (),
+        full_analysis=summary[:1_000_000],
+        analysis_character_count=len(summary),
+        analysis_truncated=len(summary) > 1_000_000,
         entity_ids=tuple(sorted(run_state.observed_entity_ids)),
         relationship_ids=tuple(sorted(run_state.observed_relationship_ids)),
         evidence_refs=tuple(sorted(run_state.observed_evidence_refs)),

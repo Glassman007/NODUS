@@ -38,6 +38,10 @@ module never produces one either.
 from __future__ import annotations
 
 import time
+import json
+import hashlib
+
+from backend.app.agent.provenance import EvidenceSnapshot, StructuredFinding
 
 from backend.app.agent.contracts import (
     ClaimType, ClaimVerificationResult, InvestigationStatus, SpecialistResult, SpecialistRole, VerificationStatus,
@@ -236,3 +240,103 @@ def run_verification_pass(*, impact: SpecialistResult, impact_skill_id: str | No
         summary=summary[:4000], tool_calls_made=tool_calls_made, tool_ids_called=(tool_id,),
         claim_verifications=tuple(claims),
     )
+
+
+def snapshots_accessible(registry: dict[str, EvidenceSnapshot], repository, include_history: bool = False) -> bool:
+    checked_records = set()
+    for snapshot in registry.values():
+        historical = snapshot.include_history or include_history
+        key = (snapshot.source_id, snapshot.record_id, historical)
+        if key not in checked_records:
+            if repository.source_record(*key) is None:
+                return False
+            checked_records.add(key)
+        if snapshot.kind == "ENTITY_ASSERTION":
+            observed = json.loads(snapshot.excerpt)
+            entity = repository.get_entity_history(observed["entity_id"]) if historical else repository.get_entity(observed["entity_id"])
+            claims = repository.assertions(observed["entity_id"], limit=100)["items"] if historical else (
+                entity.provenance if entity is not None else [])
+            if entity is None or not any(all(claim.get(key) == observed.get(key)
+                for key in ("source_id", "record_id", "entity_id", "type", "name", "description"))
+                for claim in claims):
+                return False
+    return True
+
+
+def retrievals_accessible(state, repository) -> bool:
+    """Recheck record/edge/assertion ACLs before replaying prior retrievals.
+
+    Also check entity projections when the caller lacks evidence permission and
+    therefore was not given source identifiers. Changes stop replay conservatively.
+    """
+    if not snapshots_accessible(state.evidence_registry, repository):
+        return False
+    for identifier, observed in state.retrieved_entities.items():
+        entity = (repository.get_entity_history(identifier) if identifier in state.historical_entities
+                  else repository.get_entity(identifier))
+        if entity is None or any(entity.model_dump(mode="json").get(key) != value for key, value in observed.items()):
+            return False
+    for identifier, observed in state.retrieved_relationships.items():
+        edge = repository.relationship(identifier, include_history=identifier in state.historical_relationships)
+        if edge is None or any(edge.model_dump(mode="json").get(key) != value for key, value in observed.items()):
+            return False
+    return True
+
+
+def verify_snapshots(registry: dict[str, EvidenceSnapshot], repository,
+                     paths: tuple[dict, ...] = ()) -> tuple[StructuredFinding, ...]:
+    """Re-fetch exact edges under current authorization, without a model call.
+
+    These claims assert only the typed edge's existence. They never assert an
+    outage, causal consequence, or support the surrounding generated narrative.
+    """
+    findings = []
+    for snapshot in registry.values():
+        if snapshot.kind != "GRAPH_RELATIONSHIP":
+            continue
+        observed = json.loads(snapshot.excerpt)
+        try:
+            current = repository.relationship(observed["id"])
+            current_data = current.model_dump(mode="json") if current is not None else None
+            equal = current_data is not None and all(
+                current_data.get(key) == observed.get(key)
+                for key in ("id", "source_id", "target_id", "type", "source_id_ref", "record_id", "active", "origin", "derivation_rule_version"))
+            status = "SUPPORTED" if equal else "STALE"
+            explanation = "Exact typed graph edge independently re-read under current source scope." if equal else (
+                "The edge is no longer available or has changed; this snapshot is historical.")
+            if equal and observed.get("origin") == "inferred":
+                status = "INFERRED"
+                explanation = "This recorded edge is derived by a rule; its existence was rechecked, but it remains an inferred relationship."
+        except Exception:
+            status, explanation = "UNVERIFIED", "Independent graph re-read was unavailable."
+        findings.append(StructuredFinding(
+            finding_id="finding_" + snapshot.evidence_id[3:],
+            claim=f"{observed['source_id']} {observed['type']} {observed['target_id']}",
+            claim_type="GRAPH_RELATIONSHIP", verification_status=status,
+            evidence_ids=(snapshot.evidence_id,),
+            entity_ids=(observed["source_id"], observed["target_id"]),
+            relationship_ids=(observed["id"],), explanation=explanation))
+    edge_findings = {finding.relationship_ids[0]: finding for finding in findings}
+    for path in paths:
+        nodes, edges = tuple(path["nodes"]), tuple(path["relationships"])
+        if not edges or len(nodes) != len(edges) + 1:
+            continue
+        evidence_ids = tuple(dict.fromkeys(identifier for edge in edges if edge in edge_findings
+            for identifier in edge_findings[edge].evidence_ids))
+        complete = all(edge in edge_findings for edge in edges)
+        contiguous = complete and all(
+            {nodes[i], nodes[i + 1]} == set(edge_findings[edge].entity_ids)
+            for i, edge in enumerate(edges))
+        supported = contiguous and all(edge_findings[edge].verification_status == "SUPPORTED" for edge in edges)
+        outcomes = {edge_findings[edge].verification_status for edge in edges if edge in edge_findings}
+        status = "SUPPORTED" if supported else (
+            "INVALID_REFERENCE" if not contiguous else "UNVERIFIED" if "UNVERIFIED" in outcomes else
+            "STALE" if "STALE" in outcomes else "INFERRED")
+        identifier = hashlib.sha256(json.dumps((nodes, edges)).encode()).hexdigest()
+        findings.append(StructuredFinding(finding_id="path_" + identifier,
+            claim="Recorded graph connection: " + " → ".join(nodes), claim_type="GRAPH_PATH",
+            verification_status=status, evidence_ids=evidence_ids, entity_ids=nodes, relationship_ids=edges,
+            explanation="Every edge and intermediate node in this retrieved path was independently re-read. Edge directions and types remain as recorded in each snapshot; this connection does not prove causal impact."
+                if supported else "This path includes a rule-derived relationship; it remains inferred."
+                if status == "INFERRED" else "One or more required path edges are missing, stale, restricted, or untraceable."))
+    return tuple(findings)

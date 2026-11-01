@@ -98,7 +98,8 @@ def test_missing_trust_ledger_fails_closed_not_open(tmp_path):
 # 2. Progressive metadata/instruction loading
 def test_discovery_is_compact_and_instructions_load_only_on_request():
     candidates = discover_candidates([REPO_SKILLS_ROOT])
-    assert {c.skill_id for c in candidates} == set(SKILL_IDS)
+    assert {c.skill_id for c in candidates} == set(SKILL_IDS) | {
+        "pr-impact", "blocker-chain", "decision-genealogy", "expert-finder"}
     registry = build_production_skill_registry(tool_registry=_tool_registry())
     for skill_id in SKILL_IDS:
         descriptor = registry.resolve(skill_id, "1.0.0")

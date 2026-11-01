@@ -63,6 +63,9 @@ def refresh_authorization(context: AuthorizationContext, tool_executor: ToolExec
     if not isinstance(store, GovernanceStore):
         return context
     refreshed_principal = refresh_principal_source_ids(context.principal, store)
+    from backend.app.governance.identity import investigation_read_principal
+    refreshed_principal = investigation_read_principal(
+        refreshed_principal, context.selected_source_ids, context.project_id, store)
     if refreshed_principal.source_ids == context.principal.source_ids and \
             refreshed_principal.permissions == context.principal.permissions:
         return context
@@ -202,8 +205,57 @@ class DeterministicToolAdapter(BaseTool):
             correlation_id=run_state.exec_context.run_id,
         )
         result = run_state.tool_executor.execute(invocation)
+        from backend.app.agent.provenance import capture
+        from backend.app.governance.identity import recipient_authorized_sources
+        from backend.app.tools.contracts import ToolResult, ToolStatus
+        pending = dict(run_state.evidence_registry)
+        retrieved_records = []
+        include_history = bool(args.get("include_history")) or self.spec.tool_id == "evidence.verify"
+        try:
+            if len(result.evidence_refs) > 100:
+                raise OverflowError("Evidence reference limit reached")
+            if result.evidence_refs and run_state.tool_executor.dependencies.graph_store is not None:
+                from backend.app.tools.graph_tools import _repository
+                repository = _repository(invocation.context, run_state.tool_executor.dependencies)
+                scope = recipient_authorized_sources(invocation.context)
+                for reference in result.evidence_refs[:100]:
+                    candidates = sorted(scope or invocation.context.principal.source_ids, key=len, reverse=True)
+                    source = next((item for item in candidates if reference.startswith(item + ":")), None)
+                    if source is None and scope is None:
+                        source = reference.partition(":")[0]
+                    if source is None or (scope is not None and source not in scope):
+                        raise PermissionError("Evidence reference exceeds source scope")
+                    record = reference[len(source) + 1:]
+                    metadata = repository.source_record(source, record, include_history=include_history)
+                    if metadata is None:
+                        raise PermissionError("Evidence record is unavailable")
+                    retrieved_records.append(metadata)
+            evidence_ids = capture(
+                run_state.exec_context.run_id, self.spec.tool_id,
+                {"data": result.data or {}, "retrieved_records": retrieved_records},
+                result.graph_revision, recipient_authorized_sources(invocation.context), pending,
+                include_history=include_history)
+        except (PermissionError, OverflowError):
+            run_state.provenance_rejections += 1
+            evidence_ids = ()
+            retrieved_records = []
+            run_state.observed_source_limitations.append("Retrieval withheld: provenance scope or snapshot limit.")
+            result = ToolResult(tool_id=result.tool_id, version=result.version,
+                correlation_id=result.correlation_id, status=ToolStatus.INCOMPLETE,
+                data={"message": "Retrieval withheld: provenance scope or snapshot limit."}, truncated=True)
+        except Exception:
+            evidence_ids, retrieved_records = (), []
+            run_state.observed_source_limitations.append("Retrieval withheld: provenance capture unavailable.")
+            result = ToolResult(tool_id=result.tool_id, version=result.version,
+                correlation_id=result.correlation_id, status=ToolStatus.UNAVAILABLE,
+                error_category="provenance_capture_unavailable")
+        else:
+            run_state.evidence_registry = pending
+            result = result.model_copy(update={"evidence_refs": tuple(sorted(set(result.evidence_refs) | {
+                f"{pending[identifier].source_id}:{pending[identifier].record_id}" for identifier in evidence_ids}))})
         run_state.record_tool_result(self.spec.tool_id, self.spec.version, result, arguments=args)
-        return result.model_dump(mode="json")
+        return {**result.model_dump(mode="json"), "evidence_ids": evidence_ids,
+                "retrieved_records": retrieved_records}
 
 
 def build_investigation_tools(tool_registry: ToolRegistry,

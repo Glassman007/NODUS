@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  ArrowDownToLine,
   ArrowRight,
   ArrowUpRight,
   Boxes,
@@ -41,6 +40,8 @@ import { SourceCatalog } from "../workspace/sourceCatalog";
 import { WorkspaceSidebar, type NavigationCounts } from "./WorkspaceSidebar";
 import { SessionActivity, SessionVerification } from "./SessionViews";
 import { SourceExplorer } from "./SourceExplorer";
+import {TaskNotificationBanner} from "./TaskNotificationBanner";
+const TaskWorkspace=lazy(()=>import("./TaskWorkspace").then(module=>({default:module.TaskWorkspace})));
 interface Props {
   context: AuthorizationContext;
   scope: ProjectScope | null;
@@ -55,21 +56,14 @@ interface Item {
   name?: string;
   [key: string]: unknown;
 }
-export interface Run {
-  run_id: string;
-  status: string;
-  summary: string;
-  findings: string[];
-  entity_ids: string[];
-  relationship_ids: string[];
-  evidence_refs: string[];
-  source_coverage_limitations: string[];
-  unresolved_conflicts: string[];
-  rejected_unverified_claims: string[];
-  error_message?: string;
-  objective: string;
-  created: string;
-}
+export type Run = SessionRun;
+import { parseInvestigationResult, submitInvestigation, type SessionRun } from "../investigations/api";
+import { reportTitle, type ReportTab } from "../investigations/report";
+import {
+  InvestigationResultView,
+  type ReportActions,
+} from "./InvestigationResultView";
+
 type Source = SourceMetadata;
 const examples = [
   "What systems could be affected if the authentication API changes?",
@@ -315,7 +309,12 @@ function ProjectWorkspace({
   const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
+  const [reportTab, setReportTab] = useState<ReportTab>("overview");
+  const reportActions = useRef<ReportActions>(null);
   const [objective, setObjective] = useState("");
+  const [entityHint, setEntityHint] = useState("");
+  const [executing, setExecuting] = useState(false);
+  const submitting = useRef(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [sourcesLoaded, setSourcesLoaded] = useState(false);
@@ -334,6 +333,7 @@ function ProjectWorkspace({
   const [justification, setJustification] = useState("");
   const [message, setMessage] = useState("");
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
+  const [selectedTaskId,setSelectedTaskId] = useState<string|null>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const mounted = useRef(true);
   const graphSequence = useRef(0);
@@ -345,6 +345,16 @@ function ProjectWorkspace({
     context.capabilities.reviewAccessRequests &&
     context.permissions.includes("ADMIN");
   const graphPath = `workspaces/${encodeURIComponent(workspace)}`;
+  const openTask=(id:string)=>{setSelectedTaskId(id);navigate("tasks");};
+  const openTaskInvestigation=(id:string)=>{
+    void perform(async()=>{
+      const raw=await request<Record<string,unknown>>(`${graphPath}/investigations/${encodeURIComponent(id)}`,scope.signal);
+      const result=parseInvestigationResult(raw);
+      return {...result,objective:typeof raw.objective==="string"?raw.objective:"Source investigation",
+        created:typeof raw.created_at==="string"?raw.created_at:new Date().toISOString(),
+        workspaceId:workspace,projectId:project.id,entityId:result.starting_entity_id??undefined,selectedSourceIds:result.selected_source_ids??[]} as Run;
+    },run=>{setSelectedRun(run);setReportTab("overview");navigate("investigations");});
+  };
   useEffect(() => {
     mounted.current = true;
     setLoading(true);
@@ -368,7 +378,10 @@ function ProjectWorkspace({
           if (!controller.signal.aborted) {
             setSources(
               data.items.filter(
-                (s) => !s.owner_project_id || s.owner_project_id === project.id,
+                (s) =>
+                  (!s.owner_project_id || s.owner_project_id === project.id) &&
+                  (!context.sourceIds ||
+                    context.sourceIds.includes(s.source_id)),
               ),
             );
             setSourcesLoaded(true);
@@ -430,27 +443,57 @@ function ProjectWorkspace({
     window.setTimeout(() => input.current?.focus(), 0);
   }
   async function investigate() {
-    if (busy || !objective.trim() || !workspace || !selectedSources.length)
+    if (
+      submitting.current ||
+      scope.signal.aborted ||
+      !can("EXECUTE_TOOL") ||
+      !workspaces.some((item) => item.id === workspace) ||
+      !objective.trim() ||
+      !selectedSources.length ||
+      selectedSources.some(
+        (id) => !sources.some((source) => source.source_id === id),
+      )
+    )
       return;
-    setBusy(true);
+    const captured = {
+      project_id: project.id,
+      objective: objective.trim(),
+      selected_source_ids: [...selectedSources],
+      ...(entityHint.trim() ? { entity_id: entityHint.trim() } : {}),
+    };
+    submitting.current = true;
+    setExecuting(true);
     await perform(
-      () =>
-        request<Run>(`${graphPath}/investigations`, scope.signal, {
-          objective: objective.trim(),
-          selected_source_ids: selectedSources,
-        }),
+      () => submitInvestigation(request, workspace, captured, scope.signal),
       (result) => {
-        const run = {
+        const run: Run = {
           ...result,
-          objective: objective.trim(),
+          objective: captured.objective,
           created: new Date().toISOString(),
+          workspaceId: workspace,
+          projectId: project.id,
+          selectedSourceIds: captured.selected_source_ids,
+          entityId: result.starting_entity_id??captured.entity_id,
         };
         setRuns((old) => [run, ...old]);
         setSelectedRun(run);
+        setReportTab("overview");
         navigate("investigations");
       },
     );
-    if (mounted.current) setBusy(false);
+    submitting.current = false;
+    if (mounted.current) setExecuting(false);
+  }
+  async function loadSavedInvestigations() {
+    await perform(async () => {
+      const base = `workspaces/${encodeURIComponent(workspace)}/investigations`;
+      const listing = await request<{items: {run_id: string; objective: string; created_at: string; project_id: string | null}[]}>(base, scope.signal);
+      return Promise.all(listing.items.filter((item) => item.project_id === project.id).map(async (item) => {
+        const result = parseInvestigationResult(await request<unknown>(`${base}/${encodeURIComponent(item.run_id)}`, scope.signal));
+        return {...result, objective: item.objective, created: item.created_at, workspaceId: workspace,
+          projectId: project.id, entityId: result.starting_entity_id??undefined, selectedSourceIds: result.selected_source_ids ?? []} as Run;
+      }));
+    }, (saved) => setRuns((old) => [...saved, ...old.filter((run) => !saved.some((item) => item.run_id === run.run_id))]));
   }
   async function loadAccess() {
     if (accessLoading) return;
@@ -546,10 +589,11 @@ function ProjectWorkspace({
                     className="row-link"
                     onClick={() => {
                       setSelectedRun(run);
+                      setReportTab("overview");
                       navigate("investigations");
                     }}
                   >
-                    {run.objective}
+                    {reportTitle(run)}
                   </button>
                   <small>{project.id}</small>
                 </td>
@@ -567,9 +611,10 @@ function ProjectWorkspace({
                 <td>
                   <button
                     className="icon-button"
-                    aria-label={`Open ${run.objective}`}
+                    aria-label={`Open ${reportTitle(run)}`}
                     onClick={() => {
                       setSelectedRun(run);
+                      setReportTab("overview");
                       navigate("investigations");
                     }}
                   >
@@ -608,7 +653,7 @@ function ProjectWorkspace({
           <dd>{context.role}</dd>
           <dt>Access model</dt>
           <dd>Permission scoped</dd>
-          <dt>Graph workspace</dt>
+          <dt>Knowledge workspace</dt>
           <dd>{workspace || "Unavailable"}</dd>
           <dt>Source selection</dt>
           <dd>{selectedSources.length} selected</dd>
@@ -627,21 +672,23 @@ function ProjectWorkspace({
             Permission-aware workspace
           </span>
         </div>
-        <div className="page-heading">
-          <div>
-            <p className="section-kicker">ENGINEERING INTELLIGENCE</p>
-            <h1>{view === "overview" ? "Workspace Overview" : title}</h1>
-            <p>
-              {view === "overview"
-                ? `Welcome back, ${context.identity.name.split(" ")[0]}. Follow the evidence. Understand the connections.`
-                : views.find((item) => item.id === view)?.description}
-            </p>
+        {!(view === "investigations" && selectedRun) && (
+          <div className="page-heading">
+            <div>
+              <p className="section-kicker">ENGINEERING INTELLIGENCE</p>
+              <h1>{view === "overview" ? "Workspace Overview" : title}</h1>
+              <p>
+                {view === "overview"
+                  ? `Welcome back, ${context.identity.name.split(" ")[0]}. Follow the evidence. Understand the connections.`
+                  : views.find((item) => item.id === view)?.description}
+              </p>
+            </div>
+            <button className="primary" onClick={start}>
+              <Plus size={16} />
+              New Investigation
+            </button>
           </div>
-          <button className="primary" onClick={start}>
-            <Plus size={16} />
-            New Investigation
-          </button>
-        </div>
+        )}
         {error && (
           <div className="notice error" role="alert">
             {error}
@@ -660,6 +707,7 @@ function ProjectWorkspace({
             </button>
           </div>
         )}
+        {workspace&&can("READ_GRAPH")&&<TaskNotificationBanner workspaceId={workspace} scope={scope} request={request} openTask={openTask}/>}
         {message && (
           <div
             className="notice"
@@ -674,6 +722,16 @@ function ProjectWorkspace({
             >
               <X size={16} />
             </button>
+          </div>
+        )}
+        {executing && (
+          <div className="notice investigation-progress" role="status">
+            <LoaderCircle className="spin" size={17} />
+            <span>
+              Investigation in progress. The backend is processing your
+              objective. Navigating away or changing identity does not guarantee
+              backend cancellation.
+            </span>
           </div>
         )}
         {loading && (
@@ -771,7 +829,7 @@ function ProjectWorkspace({
                   placeholder="What would you like to understand about your project?"
                   rows={3}
                   maxLength={4000}
-                  disabled={busy}
+                  disabled={executing}
                 />
                 <div className="command-context">
                   <span>
@@ -782,7 +840,7 @@ function ProjectWorkspace({
                     <select
                       aria-label="Graph workspace"
                       value={workspace}
-                      disabled={busy}
+                      disabled={executing}
                       onChange={(e) => {
                         setWorkspace(e.target.value);
                         setRuns([]);
@@ -802,7 +860,18 @@ function ProjectWorkspace({
                     <span>Workspace: {workspace || "unavailable"}</span>
                   )}
                 </div>
-                <fieldset className="source-selection" disabled={busy}>
+                <label className="entity-hint">
+                  Entity identifier (optional)
+                  <input
+                    aria-label="Entity identifier (optional)"
+                    value={entityHint}
+                    maxLength={500}
+                    disabled={executing}
+                    onChange={(event) => setEntityHint(event.target.value)}
+                    placeholder="Select a specific entity, or leave blank"
+                  />
+                </label>
+                <fieldset className="source-selection" disabled={executing}>
                   <legend>Investigation sources · select explicitly</legend>
                   {sources.map((s) => (
                     <label
@@ -851,14 +920,14 @@ function ProjectWorkspace({
                   <button
                     className="primary"
                     disabled={
-                      busy ||
+                      executing ||
                       !can("EXECUTE_TOOL") ||
                       !workspace ||
                       !objective.trim() ||
                       !selectedSources.length
                     }
                   >
-                    {busy ? (
+                    {executing ? (
                       <>
                         <LoaderCircle className="spin" size={16} />
                         Investigating…
@@ -873,7 +942,17 @@ function ProjectWorkspace({
                 </div>
                 {!can("EXECUTE_TOOL") && (
                   <p className="inline-note">
-                    Your session does not grant investigation execution.
+                    Your session does not grant EXECUTE_TOOL. Authorized
+                    read-only views remain available.{" "}
+                    {context.capabilities.requestAccess && (
+                      <button
+                        type="button"
+                        className="quiet-button"
+                        onClick={() => navigate("access-requests")}
+                      >
+                        View access requests
+                      </button>
+                    )}
                   </p>
                 )}
               </form>
@@ -882,7 +961,7 @@ function ProjectWorkspace({
                 {examples.map((example, i) => (
                   <button
                     key={example}
-                    disabled={busy}
+                    disabled={executing}
                     onClick={() => {
                       setObjective(example);
                       input.current?.focus();
@@ -911,8 +990,7 @@ function ProjectWorkspace({
               </div>
               <RunTable limit={4} />
               <div className="panel-footnote">
-                Session activity only · Historical investigation retrieval is
-                not exposed by the API.
+                Saved investigations can be reopened from the investigations view.
               </div>
             </section>
             <div className="overview-bottom">
@@ -972,119 +1050,56 @@ function ProjectWorkspace({
             </div>
           </>
         )}
+        {(view === "tasks" || view === "notifications") && workspace && <Suspense fallback={<p className="loading-state">Loading tasks?</p>}><TaskWorkspace
+          key={`${workspace}-${view}-${selectedTaskId??"list"}`} workspaceId={workspace} scope={scope} request={request}
+          initialTaskId={view==="tasks"?selectedTaskId:null} notificationsOnly={view==="notifications"}
+          openInvestigation={openTaskInvestigation}/></Suspense>}
         {view === "investigations" && (
           <>
-            <section className="panel">
-              <div className="panel-heading">
-                <h2>Project session investigations</h2>
-                <div className="filter">
-                  <ListFilter size={14} />
-                  <input
-                    aria-label="Filter investigations"
-                    placeholder="Filter objective or status…"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                  />
-                </div>
-              </div>
-              <RunTable />
-              <div className="panel-footnote">
-                Results are held in memory and cleared on project or identity
-                changes and refresh. Resumption and handoffs have no HTTP API.
-              </div>
-            </section>
             {selectedRun && (
-              <section className="panel result-panel">
+              <button
+                className="quiet-button report-back"
+                onClick={() => setSelectedRun(null)}
+              >
+                Back to session investigations
+              </button>
+            )}
+            {!selectedRun && (
+              <section className="panel">
                 <div className="panel-heading">
-                  <h2>Investigation result</h2>
-                  <span
-                    className={`run-status ${selectedRun.status.toLowerCase()}`}
-                  >
-                    {selectedRun.status}
-                  </span>
-                </div>
-                <h3>{selectedRun.objective}</h3>
-                <code>{selectedRun.run_id}</code>
-                <p className="section-kicker">
-                  MODEL NARRATIVE · NOT INDEPENDENTLY VERIFIED
-                </p>
-                <p className="narrative">{selectedRun.summary}</p>
-                {selectedRun.findings?.map((finding, i) => (
-                  <p className="finding" key={i}>
-                    {finding}
-                  </p>
-                ))}
-                {selectedRun.error_message && (
-                  <div className="notice error">
-                    {selectedRun.error_message}
-                  </div>
-                )}
-                {(
-                  [
-                    "source_coverage_limitations",
-                    "unresolved_conflicts",
-                    "rejected_unverified_claims",
-                  ] as const
-                ).map(
-                  (key) =>
-                    selectedRun[key]?.length > 0 && (
-                      <div className="result-warning" key={key}>
-                        <h3>{key.replaceAll("_", " ")}</h3>
-                        <ul>
-                          {selectedRun[key].map((text, i) => (
-                            <li key={i}>{text}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    ),
-                )}
-                <div className="result-facts">
-                  <div>
-                    <strong>{selectedRun.entity_ids?.length ?? 0}</strong>
-                    <span>Observed entities</span>
-                  </div>
-                  <div>
-                    <strong>{selectedRun.relationship_ids?.length ?? 0}</strong>
-                    <span>Observed relationships</span>
-                  </div>
-                  <div>
-                    <strong>{selectedRun.evidence_refs?.length ?? 0}</strong>
-                    <span>Evidence references</span>
+                  <h2>Project session investigations</h2>
+                  <button className="quiet-button" onClick={() => void loadSavedInvestigations()}>Load saved investigations</button>
+                  <div className="filter">
+                    <ListFilter size={14} />
+                    <input
+                      aria-label="Filter investigations"
+                      placeholder="Filter objective or status…"
+                      value={filter}
+                      onChange={(e) => setFilter(e.target.value)}
+                    />
                   </div>
                 </div>
-                <h3>Evidence references returned by tools</h3>
-                {selectedRun.evidence_refs?.length ? (
-                  <ul className="reference-list">
-                    {selectedRun.evidence_refs.map((ref) => (
-                      <li key={ref}>
-                        <SourceLabel id={ref} reference />
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="inline-note">
-                    No supporting evidence references returned.
-                  </p>
-                )}
-                <button
-                  className="quiet-button"
-                  onClick={() => {
-                    const blob = new Blob(
-                      [JSON.stringify(selectedRun, null, 2)],
-                      { type: "application/json" },
-                    );
-                    const url = URL.createObjectURL(blob);
-                    const anchor = document.createElement("a");
-                    anchor.href = url;
-                    anchor.download = "nodus-investigation.json";
-                    anchor.click();
-                    URL.revokeObjectURL(url);
-                  }}
-                >
-                  <ArrowDownToLine size={15} />
-                  Export result
-                </button>
+                <RunTable />
+                <div className="panel-footnote">
+                  Saved reports are checked against your current access before reopening. Session-only results are cleared on refresh.
+                </div>
               </section>
+            )}
+            {selectedRun && (
+              <InvestigationResultView
+                openTask={openTask}
+                key={selectedRun.run_id}
+                run={selectedRun}
+                scope={scope}
+                request={request}
+                canReadEvidence={can("READ_EVIDENCE")}
+                canReadGraph={can("READ_GRAPH")}
+                tab={reportTab}
+                setTab={setReportTab}
+                actions={reportActions}
+                authorizedSourceIds={sources.map((source) => source.source_id)}
+                overview={start}
+              />
             )}
           </>
         )}
@@ -1094,6 +1109,7 @@ function ProjectWorkspace({
             projectId={project.id}
             openRun={(run) => {
               setSelectedRun(run);
+              setReportTab("overview");
               navigate("investigations");
             }}
           />
@@ -1103,6 +1119,7 @@ function ProjectWorkspace({
             runs={runs}
             openRun={(run) => {
               setSelectedRun(run);
+              setReportTab("overview");
               navigate("investigations");
             }}
           />
@@ -1322,18 +1339,21 @@ function ProjectWorkspace({
                       <dd>{context.company.name}</dd>
                     </div>
                     <div>
-                      <dt>Active project</dt>
+                      <dt>Currently viewing</dt>
                       <dd>{project.name}</dd>
                     </div>
                     <div>
-                      <dt>Project scope</dt>
+                      <dt>Projects you can access</dt>
                       <dd>
-                        {context.projects.map((item) => item.name).join(", ") ||
-                          "No authorized projects"}
+                        {context.projects.map((item) => (
+                          <span className="project-chip" key={item.id}>
+                            {item.name}
+                          </span>
+                        ))}
                       </dd>
                     </div>
                   </dl>
-                  <h3>Granted permissions</h3>
+                  <h3>What you're allowed to do</h3>
                   <div className="permission-list">
                     {context.permissions.map((p) => (
                       <span key={p}>
@@ -1512,13 +1532,59 @@ function ProjectWorkspace({
             <span className={`run-status ${selectedRun.status.toLowerCase()}`}>
               {selectedRun.status}
             </span>
-            <p className="context-copy">{selectedRun.objective}</p>
+            <p className="context-copy compact-report-title">
+              {reportTitle(selectedRun)}
+            </p>
+            <details className="compact-objective">
+              <summary>View original objective</summary>
+              <p>{selectedRun.objective}</p>
+            </details>
             <dl>
+              <dt>Sources selected</dt>
+              <dd>{selectedRun.selectedSourceIds.length}</dd>
+              <dt>Entities observed</dt>
+              <dd>{selectedRun.entity_ids.length}</dd>
+              <dt>Relationships observed</dt>
+              <dd>{selectedRun.relationship_ids.length}</dd>
               <dt>Evidence refs</dt>
               <dd>{selectedRun.evidence_refs?.length ?? 0}</dd>
               <dt>Verification</dt>
-              <dd>Not independently verified</dd>
+              <dd>
+                {selectedRun.evidence_refs.length
+                  ? "Not independently verified"
+                  : "Unavailable"}
+              </dd>
             </dl>
+            <div className="context-report-actions">
+              <button
+                className="context-action"
+                onClick={() => setReportTab("graph")}
+              >
+                Open graph
+                <ArrowUpRight size={13} />
+              </button>
+              <button
+                className="context-action"
+                onClick={() => setReportTab("overview")}
+              >
+                Jump to findings
+                <ArrowUpRight size={13} />
+              </button>
+              <button
+                className="context-action"
+                onClick={() => setReportTab("evidence")}
+              >
+                Review evidence
+                <ArrowUpRight size={13} />
+              </button>
+              <button
+                className="context-action"
+                onClick={() => reportActions.current?.exportReport()}
+              >
+                Export report
+                <ArrowUpRight size={13} />
+              </button>
+            </div>
           </div>
         ) : view === "knowledge" && entity ? (
           <div className="context-section">
@@ -1539,12 +1605,13 @@ function ProjectWorkspace({
                   key={run.run_id}
                   onClick={() => {
                     setSelectedRun(run);
+                    setReportTab("overview");
                     navigate("investigations");
                   }}
                 >
                   <span className="activity-marker" />
                   <span>
-                    {run.objective}
+                    {reportTitle(run)}
                     <small>
                       {run.status} ·{" "}
                       {new Date(run.created).toLocaleTimeString([], {

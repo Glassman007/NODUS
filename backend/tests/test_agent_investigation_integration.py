@@ -57,7 +57,7 @@ def isolated_neo4j():
     suffix = _name()[:12]
     container = f"gh-neo4j-agent-{suffix}"
     volume = f"gh-neo4j-agent-data-{suffix}"
-    password = secrets.token_urlsafe(24)
+    password = "test-" + secrets.token_urlsafe(24)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]

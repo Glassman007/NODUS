@@ -13,6 +13,9 @@ never from caller-supplied arbitrary JSON. See its docstring.
 """
 from __future__ import annotations
 
+from backend.app.agent.provenance import EvidenceSnapshot, StructuredFinding
+from backend.app.resolution_models import ActionableProblem, OwnershipDecision
+
 from enum import StrEnum
 
 from pydantic import Field, model_validator
@@ -123,15 +126,33 @@ class InvestigationResult(Record):
     are built by the orchestrator (``backend/app/agent/investigator.py``)
     from actually-executed ``ToolResult`` payloads — never parsed out of the
     model's free-text answer. ``summary``/``findings`` are the model's
-    narrative and may describe more than the structured fields capture, but
-    the structured fields are the only parts the application treats as
-    verified. ``rejected_unverified_claims`` names anything the model's
+    narrative and may describe more than retrieval captured. Identifiers and
+    citations establish provenance only; ``structured_findings`` carry explicit
+    claim-level verification outcomes. ``rejected_unverified_claims`` names anything the model's
     narrative referenced that no tool call actually returned.
     """
     run_id: str = Field(min_length=1)
     status: InvestigationStatus
     summary: str = Field(min_length=1, max_length=4000)
+    # Keep the compatible summary preview while retaining the available model analysis.
+    full_analysis: str | None = Field(default=None, max_length=1_000_000)
+    analysis_character_count: int | None = Field(default=None, ge=0)
+    analysis_truncated: bool = False
     findings: tuple[str, ...] = ()
+    evidence_registry: tuple[EvidenceSnapshot, ...] = ()
+    structured_findings: tuple[StructuredFinding, ...] = ()
+    verification_status: str = "UNVERIFIED"
+    source_usage: dict[str, int] = Field(default_factory=dict)
+    restricted_retrieval_attempts: int = Field(default=0, ge=0)
+    selected_source_ids: tuple[str, ...] = ()
+    requested_source_ids: tuple[str, ...] = ()
+    verification_summary: dict[str, int] = Field(default_factory=dict)
+    project_id: str | None = None
+    starting_entity_id: str | None = None
+    persistence_status: str = "UNAVAILABLE"
+    actionable_findings: tuple[ActionableProblem, ...] = ()
+    ownership_decisions: tuple[OwnershipDecision, ...] = ()
+    resolution_status: str = "NOT_EVALUATED"
     entity_ids: tuple[str, ...] = ()
     relationship_ids: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
@@ -153,6 +174,37 @@ class InvestigationResult(Record):
     model_usage: ModelUsageSummary = Field(default_factory=ModelUsageSummary)
     tool_calls: tuple[ToolCallRecord, ...] = ()
     error_message: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def valid_evidence_membership(self):
+        identifiers = {item.evidence_id for item in self.evidence_registry}
+        if len(identifiers) != len(self.evidence_registry) or any(
+                item.run_id != self.run_id for item in self.evidence_registry):
+            raise ValueError("Evidence registry must contain unique, run-bound snapshots")
+        for finding in self.structured_findings:
+            if finding.verification_status in ("SUPPORTED", "INFERRED") and (
+                    not finding.evidence_ids or not set(finding.evidence_ids) <= identifiers):
+                raise ValueError("Checked findings require this run's retrieved evidence")
+        for problem in self.actionable_findings:
+            if problem.verification_status == "SUPPORTED" and (not problem.evidence_ids or
+                    not set((*problem.evidence_ids,*problem.ownership.evidence_ids)) <= identifiers):
+                raise ValueError("Actionable problems require this run's problem and ownership evidence")
+        return self
+
+    @model_validator(mode="after")
+    def consistent_analysis_bounds(self):
+        if self.full_analysis is None:
+            if self.analysis_character_count is not None or self.analysis_truncated:
+                raise ValueError("Analysis metadata requires full_analysis")
+        elif self.analysis_character_count is not None:
+            length = len(self.full_analysis)
+            if self.analysis_character_count < length:
+                raise ValueError("Analysis character count cannot be shorter than returned analysis")
+            if self.analysis_truncated != (self.analysis_character_count > length):
+                raise ValueError("Analysis truncation metadata is inconsistent")
+        elif self.analysis_truncated:
+            raise ValueError("Truncated analysis requires the original character count")
+        return self
 
 
 class SpecialistRole(StrEnum):
@@ -181,6 +233,11 @@ class VerificationStatus(StrEnum):
     CONTRADICTED = "CONTRADICTED"
     STALE = "STALE"
     NOT_CHECKED = "NOT_CHECKED"
+    INFERRED = "INFERRED"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    INVALID_REFERENCE = "INVALID_REFERENCE"
+    SOURCE_RESTRICTED = "SOURCE_RESTRICTED"
+    UNVERIFIED = "UNVERIFIED"
 
 
 class ClaimVerificationResult(Record):

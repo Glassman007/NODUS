@@ -23,7 +23,11 @@ from backend.app.security import AuthorizationContext, Permission, Principal
 NEXUS_TENANT_ID = "nexus-tenant"
 
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
-    "ADMIN": frozenset({Permission.ADMIN}),
+    # AuthorizationContext carries explicit delegated capabilities. ADMIN's
+    # principal-level permits() shortcut must not replace these concrete grants.
+    "ADMIN": frozenset({Permission.ADMIN, Permission.READ_GRAPH, Permission.READ_EVIDENCE,
+                        Permission.EXECUTE_TOOL, Permission.MANAGE_INGESTION, Permission.WRITE_GRAPH,
+                        Permission.APPROVE_ACTION, Permission.MANAGE_TASKS}),
     "DEVELOPER": frozenset({Permission.READ_GRAPH, Permission.READ_EVIDENCE, Permission.EXECUTE_TOOL}),
     "INTERN": frozenset({Permission.READ_GRAPH, Permission.READ_EVIDENCE}),
 }
@@ -175,6 +179,29 @@ def principal_authorizes_action(principal: Principal, resource_id: str, action: 
     return action in authorized_actions_for(principal, resource_id, store)
 
 
+def investigation_read_principal(principal: Principal, selected_source_ids: tuple[str, ...] | None,
+                                 project_id: str | None, store: GovernanceStore) -> Principal:
+    """Narrow fresh governance scope using the shared READ-action policy."""
+    if principal.tenant_id != NEXUS_TENANT_ID or not principal.subject.startswith("nexus:"):
+        return principal
+    scope = set(principal.source_ids)
+    if selected_source_ids is not None:
+        scope.intersection_update(selected_source_ids)
+    if project_id is not None:
+        employee = principal.subject.removeprefix("nexus:")
+        projects = store.read("SELECT project_id FROM nexus_project_assignments WHERE project_id=%s LIMIT 1", (project_id,))
+        if not projects or (Permission.ADMIN not in principal.permissions and
+                            project_id not in _assigned_project_ids(employee, store)):
+            return principal.model_copy(update={"source_ids": (), "permissions": frozenset()})
+        allowed = store.read("""SELECT source_id FROM nexus_sources
+            WHERE source_id = ANY(%s) AND (owner_project_id IS NULL OR owner_project_id=%s)
+            """, (sorted(scope), project_id))
+        scope.intersection_update(row["source_id"] for row in allowed)
+    readable = tuple(sorted(source for source in scope
+                            if principal_authorizes_action(principal, source, "READ", store)))
+    return principal.model_copy(update={"source_ids": readable})
+
+
 def _effective_source_ids(role_code: str, employee_id: str, store: GovernanceStore) -> tuple[str, ...]:
     now = datetime.now(timezone.utc)
     all_sources = store.read("SELECT source_id, classification, owner_project_id FROM nexus_sources")
@@ -242,12 +269,11 @@ def refresh_principal_source_ids(principal: Principal, store: GovernanceStore) -
     once at run start — do not remove this call in favor of "just use
     exec_context.authorization directly" without re-introducing that gap.
 
-    No-op (returns ``principal`` unchanged) for a non-NEXUS or already-ADMIN
-    principal. A principal whose demo identity/role can no longer be resolved
+    No-op for non-NEXUS principals. NEXUS administrators are also refreshed. A principal whose demo identity/role can no longer be resolved
     (e.g. deleted) loses all source access and permissions outright, rather
     than keeping its stale snapshot.
     """
-    if Permission.ADMIN in principal.permissions or principal.tenant_id != NEXUS_TENANT_ID:
+    if principal.tenant_id != NEXUS_TENANT_ID:
         return principal
     if not principal.subject.startswith("nexus:"):
         return principal
@@ -302,12 +328,11 @@ def recipient_authorized_sources(authorization: AuthorizationContext) -> frozens
     principal may CURRENTLY read, same composition every Stage 12/04 tool handler already uses (see
     e.g. ``backend.app.tools.graph_tools._scoped_source_ids``)."""
     governance_scope = authorized_source_ids_for(authorization.principal)
-    selection_scope = frozenset(authorization.principal.source_ids) if authorization.principal.source_ids else None
-    if governance_scope is None:
-        return selection_scope
-    if selection_scope is None:
-        return governance_scope
-    return governance_scope & selection_scope
+    own_scope = (frozenset(authorization.principal.source_ids) if authorization.principal.source_ids or
+                 authorization.principal.tenant_id == NEXUS_TENANT_ID else None)
+    ceiling = frozenset(authorization.selected_source_ids) if authorization.selected_source_ids is not None else None
+    scopes = [scope for scope in (governance_scope, own_scope, ceiling) if scope is not None]
+    return frozenset.intersection(*scopes) if scopes else None
 
 
 def principal_exists(subject: str, store: GovernanceStore) -> bool | None:

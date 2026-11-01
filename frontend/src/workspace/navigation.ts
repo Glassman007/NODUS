@@ -1,4 +1,4 @@
-﻿import {
+import {
   Activity,
   FileCheck2,
   FolderKanban,
@@ -9,10 +9,14 @@
   ShieldCheck,
   GitPullRequest,
   ScrollText,
+  ClipboardCheck,
+  Bell,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { AuthorizationContext } from "../auth/models";
 export type View =
+  | "tasks"
+  | "notifications"
   | "overview"
   | "investigations"
   | "projects"
@@ -46,6 +50,8 @@ export const views: readonly Destination[] = [
     group: "WORKSPACE",
     description: "Open and review investigations run in this project session.",
   },
+  {id:"tasks",label:"Tasks",icon:ClipboardCheck,group:"WORKSPACE",description:"Evidence-backed remediation work and team progress.",permission:"READ_GRAPH"},
+  {id:"notifications",label:"Notifications",icon:Bell,group:"WORKSPACE",description:"Authorized team assignment notifications.",permission:"READ_GRAPH"},
   {
     id: "projects",
     label: "Projects",

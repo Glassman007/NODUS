@@ -1,4 +1,5 @@
-﻿import { Activity, ArrowUpRight, FileCheck2 } from "lucide-react";
+import { reportTitle } from "../investigations/report";
+import { Activity, ArrowUpRight, FileCheck2 } from "lucide-react";
 import type { Run } from "./AuthorizedWorkspace";
 import { SourceLabel } from "./SourceLabel";
 interface Props {
@@ -23,13 +24,13 @@ export function SessionActivity({
               <span className="activity-marker" />
               <div>
                 <button className="row-link" onClick={() => openRun(run)}>
-                  {run.objective}
+                  {reportTitle(run)}
                 </button>
                 <p>
                   <span className={`run-status ${run.status.toLowerCase()}`}>
                     {run.status}
                   </span>{" "}
-                  {projectId}{" "}
+                  {projectId} · {run.selectedSourceIds.length} selected sources{" "}
                   <time dateTime={run.created}>
                     {new Date(run.created).toLocaleString()}
                   </time>
@@ -37,7 +38,7 @@ export function SessionActivity({
               </div>
               <button
                 className="icon-button"
-                aria-label={`Open activity: ${run.objective}`}
+                aria-label={`Open activity: ${reportTitle(run)}`}
                 onClick={() => openRun(run)}
               >
                 <ArrowUpRight size={16} />
@@ -79,7 +80,7 @@ export function SessionVerification({ runs, openRun }: Props) {
           <article className="verification-entry" key={run.run_id}>
             <div className="panel-heading">
               <button className="row-link" onClick={() => openRun(run)}>
-                {run.objective}
+                {reportTitle(run)}
               </button>
               <span className={`run-status ${run.status.toLowerCase()}`}>
                 {run.status}

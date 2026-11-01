@@ -13,6 +13,7 @@ class Permission(StrEnum):
     EXECUTE_TOOL = "EXECUTE_TOOL"
     APPROVE_ACTION = "APPROVE_ACTION"
     ADMIN = "ADMIN"
+    MANAGE_TASKS = "MANAGE_TASKS"
 
 
 class Principal(BaseModel):
@@ -45,6 +46,9 @@ class AuthorizationContext(BaseModel):
     task_id: str = Field(min_length=1)
     permissions: frozenset[Permission] = Field(default_factory=lambda: frozenset({Permission.READ_GRAPH}))
     approved_permissions: frozenset[Permission] = Field(default_factory=frozenset)
+    # None preserves legacy caller scope; () explicitly denies every source.
+    selected_source_ids: tuple[str, ...] | None = None
+    project_id: str | None = None
 
     @model_validator(mode="after")
     def restricted(self):
@@ -52,6 +56,8 @@ class AuthorizationContext(BaseModel):
             raise ValueError("Authorization scope exceeds principal scope")
         if not all(self.principal.permits(permission) for permission in self.permissions):
             raise ValueError("Delegated permissions exceed principal permissions")
+        if self.selected_source_ids is not None and any(not source for source in self.selected_source_ids):
+            raise ValueError("Selected source identifiers cannot be empty")
         if not self.approved_permissions <= self.permissions:
             raise ValueError("Approvals must be within delegated permissions")
         return self

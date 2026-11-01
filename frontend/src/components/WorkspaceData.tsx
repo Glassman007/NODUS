@@ -18,6 +18,7 @@ function Value({
     field &&
     [
       "source_id",
+      "source_id_ref",
       "source_ids",
       "selected_source_ids",
       "supporting_source_ids",

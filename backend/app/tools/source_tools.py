@@ -11,7 +11,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from backend.app.governance.identity import authorized_source_ids_for
+from backend.app.governance.identity import recipient_authorized_sources
 from backend.app.graph.repository import GraphRepository
 from backend.app.security import AuthorizationContext, Permission
 from backend.app.tools.contracts import ExecutionLimits
@@ -53,21 +53,14 @@ def _repository(context: AuthorizationContext, dependencies: ToolDependencies) -
 
 
 def _scoped_source_ids(context: AuthorizationContext) -> frozenset[str] | None:
-    """See ``backend.app.tools.graph_tools._scoped_source_ids`` (Stage 11
-    ND-11A): additionally intersects an explicit, caller-selected
-    ``principal.source_ids`` set into the read scope, for any tenant, on top
-    of whatever ``authorized_source_ids_for`` already restricts."""
-    governance_scope = authorized_source_ids_for(context.principal)
-    selection_scope = frozenset(context.principal.source_ids) if context.principal.source_ids else None
-    if governance_scope is None:
-        return selection_scope
-    if selection_scope is None:
-        return governance_scope
-    return governance_scope & selection_scope
+    return recipient_authorized_sources(context)
 
 
 def _coverage_handler(context: AuthorizationContext, input_model: SourceCoverageInput,
                       dependencies: ToolDependencies) -> dict:
+    scope = _scoped_source_ids(context)
+    if scope is not None and input_model.source_id not in scope:
+        raise PermissionError("Source is not available")
     repo = _repository(context, dependencies)
     graph_sources = repo.sources(limit=100)["items"]
     graph_entry = next((item for item in graph_sources if item["id"] == input_model.source_id), None)

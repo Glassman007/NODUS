@@ -18,6 +18,7 @@ import contextvars
 import dataclasses
 
 from backend.app.agent.contracts import AgentExecutionContext, ModelUsageSummary, ToolCallRecord
+from backend.app.agent.provenance import EvidenceSnapshot
 from backend.app.skills.contracts import SkillDescriptor, SkillManifest
 from backend.app.skills.registry import SkillRegistry
 from backend.app.tools.contracts import ToolResult
@@ -56,6 +57,15 @@ class RunState:
     observed_conflicts: list[str] = dataclasses.field(default_factory=list)
     observed_source_limitations: list[str] = dataclasses.field(default_factory=list)
     not_found_entity_ids: set[str] = dataclasses.field(default_factory=set)
+    evidence_registry: dict[str, EvidenceSnapshot] = dataclasses.field(default_factory=dict)
+    consumed_source_ids: set[str] = dataclasses.field(default_factory=set)
+    retrieved_entities: dict[str, dict] = dataclasses.field(default_factory=dict)
+    retrieved_relationships: dict[str, dict] = dataclasses.field(default_factory=dict)
+    retrieved_paths: list[dict] = dataclasses.field(default_factory=list)
+    provenance_rejections: int = 0
+    primary_entity_id: str | None = None
+    historical_entities: set[str] = dataclasses.field(default_factory=set)
+    historical_relationships: set[str] = dataclasses.field(default_factory=set)
 
     def approved_version(self, skill_id: str) -> str | None:
         for approved in self.exec_context.approved_skills:
@@ -105,7 +115,36 @@ class RunState:
             self.observed_graph_revision = result.graph_revision
 
         data = result.data or {}
+        def sources(value):
+            if isinstance(value, dict):
+                if value.get("id") and "name" in value and "type" in value:
+                    if arguments and arguments.get("include_history"):
+                        self.historical_entities.add(value["id"])
+                    self.retrieved_entities[value["id"]] = {
+                        key: value[key] for key in ("id", "type", "name", "description", "active", "conflicts") if key in value}
+                if value.get("id") and "target_id" in value and "source_id" in value:
+                    if arguments and arguments.get("include_history"):
+                        self.historical_relationships.add(value["id"])
+                    self.retrieved_relationships[value["id"]] = {
+                        key: value[key] for key in ("id", "source_id", "target_id", "type", "source_id_ref", "record_id", "active") if key in value}
+                source = value.get("source_id_ref") or (value.get("source_id") if "target_id" not in value else None)
+                if isinstance(source, str):
+                    self.consumed_source_ids.add(source)
+                for child in value.values():
+                    sources(child)
+            elif isinstance(value, list):
+                for child in value:
+                    sources(child)
+        sources(data)
+        for path in data.get("paths") or []:
+            if isinstance(path, dict) and path.get("nodes") and path.get("relationships"):
+                projection = {"nodes": [node["id"] for node in path["nodes"]],
+                              "relationships": [edge["id"] for edge in path["relationships"]]}
+                if projection not in self.retrieved_paths:
+                    self.retrieved_paths.append(projection)
         _collect_identifiers(data, self.observed_entity_ids, self.observed_relationship_ids)
+        if self.primary_entity_id is None and arguments and arguments.get("entity_id") in self.observed_entity_ids:
+            self.primary_entity_id = arguments["entity_id"]
 
         if "conflicts" in data:
             conflicts = data.get("conflicts") or {}
@@ -143,12 +182,14 @@ def _collect_identifiers(data: dict, entity_ids: set[str], relationship_ids: set
     relationship = data.get("relationship")
     if isinstance(relationship, dict) and relationship.get("id"):
         relationship_ids.add(relationship["id"])
+        entity_ids.update(relationship[key] for key in ("source_id", "target_id") if relationship.get(key))
     for node in data.get("nodes") or []:
         if isinstance(node, dict) and node.get("id"):
             entity_ids.add(node["id"])
     for rel in data.get("relationships") or []:
         if isinstance(rel, dict) and rel.get("id"):
             relationship_ids.add(rel["id"])
+            entity_ids.update(rel[key] for key in ("source_id", "target_id") if rel.get(key))
     for path in data.get("paths") or []:
         if isinstance(path, dict):
             _collect_identifiers(path, entity_ids, relationship_ids)
