@@ -1,5 +1,5 @@
 # NODUS — Enterprise Dependency Intelligence
-
+demo implementation guide - https://github.com/Glassman007/NODUS/blob/main/NODUS_Frontend_Requirements_Plan_v1.md
 > **The problem and our solution, in one line:** NODUS helps organizations prevent operational failures caused by fragmented knowledge and hidden dependencies by connecting enterprise information into a permission-aware knowledge graph, verifying change risks against evidence, and routing actionable remediation tasks to responsible teams.
 
 An organization may document an API in one place, implement its consumers in another, discuss a migration in a ticket, and assign ownership in a service registry. Individually, those records look complete. Together, they can reveal a dependency that nobody considered before making a change.
