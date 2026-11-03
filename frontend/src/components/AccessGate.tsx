@@ -1,7 +1,10 @@
-﻿import { useState } from 'react'
-interface Props { pending: boolean; error: string; onSubmit: (token: string) => void; onCancel: () => void }
-export function AccessGate({ pending, error, onSubmit, onCancel }: Props) {
+﻿import { useEffect, useState } from 'react'
+interface Props { pending: boolean; error: string; onSubmit: (token: string) => void; onCancel: () => void; prefillToken?: string }
+export function AccessGate({ pending, error, onSubmit, onCancel, prefillToken }: Props) {
   const [token, setToken] = useState('')
+  useEffect(() => {
+    if (prefillToken) setToken(prefillToken)
+  }, [prefillToken])
   return <form className="gate" noValidate onSubmit={event => { event.preventDefault(); onSubmit(token) }} aria-busy={pending}>
     <label htmlFor="access-token">Access token</label>
     <input id="access-token" type="password" value={token} onChange={event => setToken(event.target.value)}

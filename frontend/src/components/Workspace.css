@@ -588,6 +588,54 @@
 .examples > button:hover {
   color: var(--accent);
 }
+.scenario-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  padding: 16px 20px 20px;
+}
+.scenario-card {
+  border: 1px solid #263038;
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.scenario-card strong {
+  font-size: 13px;
+  color: #edf0f3;
+}
+.scenario-card p {
+  font-size: 11px;
+  color: #8d9eae;
+  margin: 0;
+}
+.scenario-sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.scenario-sources li {
+  font-size: 10px;
+  color: #b1c1d0;
+  border: 1px solid #34404b;
+  border-radius: 5px;
+  padding: 3px 7px;
+}
+.scenario-sources li.source-unauthorized {
+  color: #ffc4ba;
+  border-color: #5a3832;
+}
+.scenario-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+}
 .quiet-button {
   background: transparent;
   border: 0;

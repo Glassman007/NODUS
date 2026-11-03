@@ -27,4 +27,17 @@ select:focus-visible{outline:2px solid #c4ee77;outline-offset:4px}
 @keyframes network-pulse { 0%, 100% { opacity: .45; } 50% { opacity: .95; } }
 @keyframes network-travel { to { stroke-dashoffset: -1424; } }
 @media(max-width:600px) { .locked { padding: 28px 20px; } .locked .shell { padding: 32px 22px; } .login-network { opacity: .55; } .network-orbits { display: none; } .network-layer, .network-signal, .network-node { animation: none; } .brand-tagline { font-size: 11px; } }
+
+.page.locked { flex-wrap: wrap; align-items: flex-start; justify-content: center; gap: 28px; }
+.page.locked .login-shell { margin: 0 auto; }
+.demo-access { position: relative; z-index: 1; width: 100%; max-width: 432px; margin-top: 0; }
+.demo-access-heading { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #9ba9b6; margin: 0 0 10px; }
+.demo-access-cards { display: flex; flex-direction: column; gap: 10px; }
+.demo-card { border: 1px solid #a4b99b26; border-radius: 12px; background: #171e25f2; box-shadow: 0 12px 40px #0003; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; }
+.demo-card-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.demo-card-top strong { font-size: 14px; font-weight: 600; color: #edf0f3; }
+.demo-card small { color: #9ba9b6; font-size: 12px; }
+.demo-copy { align-self: flex-start; padding: 6px 0 0; }
+@media(min-width: 860px) { .page.locked { justify-content: center; } .page.locked .login-shell { align-self: center; } .demo-access { align-self: center; } }
+@media(max-width: 600px) { .demo-access { max-width: 100%; } }
 @media(max-width:600px){.project-row{align-items:stretch;flex-direction:column;gap:20px}.project-picker{max-width:100%}.company-row{gap:12px}.company-row .eyebrow{font-size:12px}.badge{flex-shrink:0}}

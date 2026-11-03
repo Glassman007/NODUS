@@ -36,6 +36,7 @@ import {
   type View,
 } from "../workspace/navigation";
 import { sourceLabel, type SourceMetadata } from "../workspace/sourceNames";
+import { scenariosForContext } from "../workspace/scenarios";
 import { SourceLabel } from "./SourceLabel";
 import { SourceCatalog } from "../workspace/sourceCatalog";
 import { WorkspaceSidebar, type NavigationCounts } from "./WorkspaceSidebar";
@@ -89,6 +90,86 @@ function Empty({
 function Data({ value }: { value: unknown }) {
   return <WorkspaceData value={value} />;
 }
+function TryAnInvestigation({
+  context,
+  project,
+  sources,
+  navigate,
+  onUse,
+}: {
+  context: AuthorizationContext;
+  project: { id: string; name?: string };
+  sources: Source[];
+  navigate: (next: View) => void;
+  onUse: (objective: string, selectedSources: string[]) => void;
+}) {
+  const availableIds = new Set(sources.map((s) => s.source_id));
+  const scenarios = scenariosForContext(context.role, project.id).filter(
+    (scenario) =>
+      scenario.requiredSourceIds.some((id) => availableIds.has(id)) ||
+      context.capabilities.requestAccess,
+  );
+  if (!scenarios.length) return null;
+  return (
+    <section className="panel command-center">
+      <div className="panel-heading">
+        <div className="heading-icon">
+          <Sparkles size={18} />
+          <h2>Try an Investigation</h2>
+        </div>
+      </div>
+      <div className="scenario-cards">
+        {scenarios.map((scenario) => {
+          const missing = scenario.requiredSourceIds.filter(
+            (id) => !availableIds.has(id),
+          );
+          const usable = scenario.requiredSourceIds.filter((id) =>
+            availableIds.has(id),
+          );
+          if (!usable.length && !context.capabilities.requestAccess)
+            return null;
+          return (
+            <div className="scenario-card" key={scenario.id}>
+              <strong>{scenario.title}</strong>
+              <p>{scenario.oneLiner}</p>
+              <ul className="scenario-sources">
+                {scenario.requiredSourceIds.map((id) => (
+                  <li
+                    key={id}
+                    className={missing.includes(id) ? "source-unauthorized" : undefined}
+                  >
+                    {sourceLabel(id, sources)}
+                    {missing.includes(id) && <small> · Not authorized</small>}
+                  </li>
+                ))}
+              </ul>
+              <div className="scenario-actions">
+                <button
+                  type="button"
+                  className="quiet-button"
+                  disabled={!usable.length}
+                  onClick={() => onUse(scenario.objective, usable)}
+                >
+                  Use Scenario
+                </button>
+                {missing.length > 0 && context.capabilities.requestAccess && (
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => navigate("access-requests")}
+                  >
+                    Request Access
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function initialView(): View {
   const value = location.hash.slice(1);
   return views.some((v) => v.id === value) ? (value as View) : "overview";
@@ -335,6 +416,10 @@ function ProjectWorkspace({
   const [message, setMessage] = useState("");
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
   const [selectedTaskId,setSelectedTaskId] = useState<string|null>(null);
+  const [grants, setGrants] = useState<Item[]>([]);
+  const [grantsLoaded, setGrantsLoaded] = useState(false);
+  const [grantsLoading, setGrantsLoading] = useState(false);
+  const [revoking, setRevoking] = useState(false);
   const input = useRef<HTMLTextAreaElement>(null);
   const mounted = useRef(true);
   const graphSequence = useRef(0);
@@ -511,6 +596,35 @@ function ProjectWorkspace({
       },
     );
     if (mounted.current) setAccessLoading(false);
+  }
+  async function loadGrants() {
+    if (!review || grantsLoading) return;
+    setGrantsLoading(true);
+    await perform(
+      () => request<{ items: Item[] }>("nexus/grants/active", scope.signal),
+      (data) => {
+        setGrants(data.items);
+        setGrantsLoaded(true);
+      },
+    );
+    if (mounted.current) setGrantsLoading(false);
+  }
+  async function revoke(grantId: string) {
+    if (revoking || !review) return;
+    setRevoking(true);
+    await perform(
+      () =>
+        request(
+          `nexus/grants/${encodeURIComponent(grantId)}/revoke`,
+          scope.signal,
+          {},
+        ),
+      () => {
+        setMessage("Grant revoked.");
+        void loadGrants();
+      },
+    );
+    if (mounted.current) setRevoking(false);
   }
   async function search() {
     if (!query.trim() || !workspace || searching) return;
@@ -975,6 +1089,17 @@ function ProjectWorkspace({
                 ))}
               </div>
             </section>
+            <TryAnInvestigation
+              context={context}
+              project={project}
+              sources={sources}
+              navigate={navigate}
+              onUse={(scenarioObjective, scenarioSources) => {
+                setObjective(scenarioObjective);
+                setSelectedSources(scenarioSources);
+                input.current?.focus();
+              }}
+            />
             <section className="panel">
               <div className="panel-heading">
                 <h2>
@@ -1499,6 +1624,53 @@ function ProjectWorkspace({
                 ))
               )}
             </section>
+            {review && (
+              <section className="panel">
+                <div className="panel-heading">
+                  <h2>Active grants</h2>
+                  <button
+                    className="quiet-button"
+                    disabled={grantsLoading}
+                    onClick={() => void loadGrants()}
+                  >
+                    Refresh grants
+                  </button>
+                </div>
+                {grantsLoading && (
+                  <p className="loading-state panel-body" role="status">
+                    Loading active grants...
+                  </p>
+                )}
+                {!grantsLoaded ? (
+                  <Empty title="Load active grants">
+                    Refresh to retrieve currently active, revocable grants.
+                  </Empty>
+                ) : grants.length === 0 ? (
+                  <Empty title="No active grants">
+                    There are no company-wide active grants to revoke.
+                  </Empty>
+                ) : (
+                  grants.map((g, i) => (
+                    <div className="access-request" key={String(g.grant_id ?? i)}>
+                      <strong>
+                        <SourceLabel id={String(g.resource_id)} />
+                      </strong>
+                      <span className="subtle-badge">{String(g.employee_id)}</span>
+                      <p>Permission: {String(g.permission_level ?? "READ")}</p>
+                      <div className="button-row">
+                        <button
+                          className="quiet-button"
+                          disabled={revoking}
+                          onClick={() => void revoke(String(g.grant_id))}
+                        >
+                          Revoke access
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </section>
+            )}
           </>
         )}
         <footer className="workspace-footer">

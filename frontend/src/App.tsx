@@ -1,15 +1,18 @@
+import { useState } from "react";
 import { AccessGate } from "./components/AccessGate";
 import { AuthorizedWorkspace } from "./components/AuthorizedWorkspace";
+import { DemoAccessPanel } from "./components/DemoAccessPanel";
 import { useAuthorization } from "./auth/useAuthorization";
 import "./App.css";
 import { LoginNetwork } from "./components/LoginNetwork";
 
 export default function App() {
   const auth = useAuthorization();
+  const [prefillToken, setPrefillToken] = useState("");
   return (
     <main className={auth.context ? "page authorized" : "page locked"}>
       {!auth.context && <LoginNetwork />}
-      <div className="shell">
+      <div className={auth.context ? "shell" : "shell login-shell"}>
         {!auth.context && (
           <header className="brand">
             <h1>NODUS</h1>
@@ -33,9 +36,11 @@ export default function App() {
             error={auth.error}
             onSubmit={auth.authorize}
             onCancel={auth.reset}
+            prefillToken={prefillToken}
           />
         )}
       </div>
+      {!auth.context && <DemoAccessPanel onUseToken={setPrefillToken} />}
     </main>
   );
 }

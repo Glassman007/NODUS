@@ -320,6 +320,17 @@ def revoke_grant(
     return {"grant": _grant_to_dict(updated_grant_row), "decision": _decision_to_dict(decision_row)}
 
 
+def list_active_grants(store: GovernanceStore, *, company_id: str) -> list[dict]:
+    """Company-wide active grants, for an administrator to review/revoke.
+    Unlike ``get_authorization_scope``, not scoped to a single employee."""
+    rows = store.read("""
+        SELECT * FROM nexus_resource_grants
+        WHERE company_id=%s AND status='ACTIVE' AND revoked_at IS NULL
+        ORDER BY grant_id
+        """, (company_id,))
+    return [_grant_to_dict(row) for row in rows]
+
+
 def get_authorization_scope(store: GovernanceStore, *, employee_id: str, company_id: str) -> dict:
     """Convenience read-only composite: role, project memberships, effective
     source access, and the employee's active grants. Delegates role/source

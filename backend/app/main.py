@@ -21,7 +21,7 @@ from backend.app.gateway.gateway import ModelGateway
 from backend.app.gateway.gemini_client import GeminiProviderClient
 from backend.app.governance.access_requests import (
     approve_request, create_access_request, deny_request, get_authorization_scope,
-    list_pending_requests, list_requests_for_employee, revoke_grant,
+    list_active_grants, list_pending_requests, list_requests_for_employee, revoke_grant,
 )
 from backend.app.governance.identity import (
     NEXUS_TENANT_ID, authorized_source_ids_for, isolated_demo_mode_enabled,
@@ -869,6 +869,32 @@ def nexus_session(request: Request, user: Principal = Depends(principal)):
     return summary
 
 
+@app.get("/api/v1/nexus/demo-identities")
+def nexus_demo_identities():
+    """Public, demo-mode-gated listing of the fixed judge-facing demo
+    identities (name/role/project), derived live from
+    ``demo_user_for_token`` so it can never drift from the actual backend
+    configuration. Deliberately unauthenticated -- it must render on the
+    login screen before any token is entered -- and returns nothing unless
+    GRAPH_HACKS_NEXUS_DEMO_MODE is enabled."""
+    if not isolated_demo_mode_enabled():
+        raise HTTPException(404, "Demo mode not enabled")
+
+    def card(token: str, project_id: str | None):
+        local_user = demo_user_for_token(token)
+        if local_user is None:
+            return None
+        return {
+            "token": token,
+            "display_name": local_user.display_name,
+            "role_code": local_user.role_code,
+            "project_id": project_id,
+        }
+
+    items = [card("4", None), card("dev-02-pay", "NEX-PRJ-PAY"), card("intern-10-com", "NEX-PRJ-COM")]
+    return {"items": [item for item in items if item is not None]}
+
+
 @app.get("/api/v1/nexus/sources")
 def nexus_sources(request: Request, user: Principal = Depends(principal)):
     governance_store = getattr(request.app.state, "governance_store", None)
@@ -993,6 +1019,14 @@ def nexus_revoke_grant(grant_id: str, body: RevokeGrantBody, request: Request,
             approver_employee_id=_nexus_employee_id(user), reason=body.reason)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/v1/nexus/grants/active")
+def nexus_active_grants(request: Request, user: Principal = Depends(require("ADMIN"))):
+    governance_store = getattr(request.app.state, "governance_store", None)
+    if governance_store is None:
+        return {"items": []}
+    return {"items": list_active_grants(governance_store, company_id=_NEXUS_COMPANY_ID)}
 
 
 @app.get("/api/v1/nexus/authorization-scope")
