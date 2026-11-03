@@ -14,4 +14,17 @@ select:focus-visible{outline:2px solid #c4ee77;outline-offset:4px}
 .workspace-message,.restricted{margin-top:30px}
 .restricted h2{font-size:22px;font-weight:500;margin-bottom:12px}
 .restricted p{color:#bdc6cf;font-size:14px}
+.locked { position: relative; isolation: isolate; overflow: hidden; background: #12181e; }
+.locked .shell { position: relative; z-index: 1; max-width: 432px; padding: 40px 36px 36px; border: 1px solid #a4b99b26; border-radius: 12px; background: #171e25f2; box-shadow: 0 24px 80px #0004, 0 1px 0 #d5e8bb0a inset; }
+.locked .brand { margin-bottom: 32px; }
+.brand-tagline { margin-top: 12px; color: #9ba9b6; font-size: 12px; letter-spacing: .02em; }
+.login-network { position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 82% 24%, #a4ce6710, transparent 42%), radial-gradient(ellipse at 12% 85%, #98b5780c, transparent 34%); }
+.login-network svg { display: block; width: 100%; height: 100%; position: absolute; inset: 0; }
+.network-layer { animation: network-drift 30s ease-in-out infinite alternate; }
+.network-node { animation: network-pulse 9s ease-in-out infinite; }
+.network-signal { stroke: #c4ee77; stroke-opacity: .4; stroke-dasharray: 12 700; animation: network-travel 22s linear infinite; }
+@keyframes network-drift { to { transform: translate(9px, -10px); } }
+@keyframes network-pulse { 0%, 100% { opacity: .45; } 50% { opacity: .95; } }
+@keyframes network-travel { to { stroke-dashoffset: -1424; } }
+@media(max-width:600px) { .locked { padding: 28px 20px; } .locked .shell { padding: 32px 22px; } .login-network { opacity: .55; } .network-orbits { display: none; } .network-layer, .network-signal, .network-node { animation: none; } .brand-tagline { font-size: 11px; } }
 @media(max-width:600px){.project-row{align-items:stretch;flex-direction:column;gap:20px}.project-picker{max-width:100%}.company-row{gap:12px}.company-row .eyebrow{font-size:12px}.badge{flex-shrink:0}}

@@ -1,3 +1,4 @@
+import { projectLabel } from "../workspace/projectNames";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   Activity,
@@ -165,13 +166,13 @@ export function AuthorizedWorkspace(props: Props) {
             </option>
             {props.context.projects.map((p) => (
               <option key={p.id} value={p.id}>
-                {p.name}
+                {projectLabel(p.id, p.name)}
               </option>
             ))}
           </select>
         ) : (
           <span className="single-project">
-            {project?.id ?? "No active project"}
+            {project ? projectLabel(project.id, project.name) : "No active project"}
           </span>
         )}
         <button className="global-search" onClick={() => navigate("knowledge")}>
@@ -595,7 +596,7 @@ function ProjectWorkspace({
                   >
                     {reportTitle(run)}
                   </button>
-                  <small>{project.id}</small>
+                  <small>{projectLabel(project.id, project.name)}</small>
                 </td>
                 <td>
                   <span className={`run-status ${run.status.toLowerCase()}`}>
@@ -643,7 +644,7 @@ function ProjectWorkspace({
         <div className="context-project">
           <FolderKanban size={20} />
           <div>
-            <strong>{project.id}</strong>
+            <strong>{projectLabel(project.id, project.name)}</strong>
             <small>Authorized project</small>
           </div>
           <span className="status-dot" />
@@ -834,7 +835,7 @@ function ProjectWorkspace({
                 <div className="command-context">
                   <span>
                     <FolderKanban size={14} />
-                    {project.id}
+                    {projectLabel(project.id, project.name)}
                   </span>
                   {workspaces.length > 1 ? (
                     <select
@@ -998,7 +999,7 @@ function ProjectWorkspace({
                 <p className="section-kicker">PROJECT INTELLIGENCE</p>
                 <div className="heading-icon">
                   <FolderKanban size={21} />
-                  <h2>{project.name}</h2>
+                  <h2>{projectLabel(project.id, project.name)}</h2>
                 </div>
                 <p>
                   Explore sources and relationships within your authorized
@@ -1134,8 +1135,8 @@ function ProjectWorkspace({
               <div className="project-list-item" key={p.id}>
                 <FolderKanban size={21} />
                 <div>
-                  <h3>{p.name}</h3>
-                  <small>{p.id}</small>
+                  <h3>{projectLabel(p.id, p.name)}</h3>
+                  <small>Authorized project</small>
                 </div>
                 {p.id === project.id ? (
                   <button
@@ -1340,14 +1341,14 @@ function ProjectWorkspace({
                     </div>
                     <div>
                       <dt>Currently viewing</dt>
-                      <dd>{project.name}</dd>
+                      <dd>{projectLabel(project.id, project.name)}</dd>
                     </div>
                     <div>
                       <dt>Projects you can access</dt>
                       <dd>
                         {context.projects.map((item) => (
                           <span className="project-chip" key={item.id}>
-                            {item.name}
+                            {projectLabel(item.id, item.name)}
                           </span>
                         ))}
                       </dd>
@@ -1440,7 +1441,7 @@ function ProjectWorkspace({
                     />
                   </label>
                   <p className="inline-note">
-                    Requests READ access for project {project.id}. The server
+                    Requests READ access for project {projectLabel(project.id, project.name)}. The server
                     validates the resource and your eligibility.
                   </p>
                   <button className="primary" disabled={busy}>

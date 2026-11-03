@@ -1,3 +1,4 @@
+import { projectLabel } from "../workspace/projectNames";
 import {useEffect, useState} from "react";
 import {Bell, ClipboardCheck, ArrowRight, LoaderCircle} from "lucide-react";
 import type {ProjectScope, WorkspaceRequest} from "../auth/models";
@@ -73,18 +74,18 @@ export function TaskWorkspace({workspaceId, scope, request, initialTaskId, notif
     {(loading||busy)&&<p className="loading-state" role="status"><LoaderCircle size={16} className="spin"/>Loading authorized task information…</p>}
     {!loading&&notificationsOnly&&!selected&&<section className="panel"><h3>Assignment notifications <span className="count-pill">{notifications.filter(item=>!item.read_at).length} unread</span></h3>
       {notifications.length?notifications.map(item=><button className={`notification-item ${item.read_at?"":"unread"}`} key={item.notification_id} onClick={()=>void select(item.task_id,item.notification_id)}>
-        <Bell size={18}/><span><strong>{item.title}</strong><small>{item.team_name??"Assignment review"} · {item.priority} · {item.project_id??"Workspace"}</small></span><ArrowRight size={16}/>
+        <Bell size={18}/><span><strong>{item.title}</strong><small>{item.team_name??"Assignment review"} · {item.priority} · {item.project_id ? projectLabel(item.project_id) : "Workspace"}</small></span><ArrowRight size={16}/>
       </button>):<p className="inline-note">No authorized assignment notifications.</p>}
     </section>}
     {!loading&&!notificationsOnly&&!selected&&<>
       <div className="task-filters">
-        <label>Project<select value={project} onChange={event=>setProject(event.target.value)}><option value="">All authorized projects</option>{[...new Set(tasks.map(task=>task.project_id).filter(Boolean))].map(id=><option key={id} value={id!}>{id}</option>)}</select></label>
+        <label>Project<select value={project} onChange={event=>setProject(event.target.value)}><option value="">All authorized projects</option>{[...new Set(tasks.map(task=>task.project_id).filter(Boolean))].map(id=><option key={id} value={id!}>{projectLabel(id!)}</option>)}</select></label>
         <label>Team<select value={team} onChange={event=>setTeam(event.target.value)}><option value="">All teams</option>{[...new Map(tasks.filter(task=>task.primary_team_id).map(task=>[task.primary_team_id!,task.primary_team_name??task.primary_team_id!])).entries()].map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></label>
         <label>Status<select value={status} onChange={event=>setStatus(event.target.value)}><option value="">All statuses</option>{[...new Set(tasks.map(task=>task.status))].map(value=><option key={value} value={value}>{label(value)}</option>)}</select></label>
       </div>
       <div className="task-grid">{filtered.map(task=><button className="panel task-card" key={task.task_id} onClick={()=>void select(task.task_id)}>
         <div className="task-badges"><span className={`priority-badge priority-${task.priority.toLowerCase()}`}>{task.priority}</span><span className="run-status">{label(task.status)}</span></div>
-        <h3>{task.title}</h3><p>{task.description}</p><p className="inline-note">{task.primary_team_name??"Administrator assignment review"} · {task.service_id}</p><small>{task.evidence_ids.length} evidence snapshots · {task.project_id??"Workspace"}</small>
+        <h3>{task.title}</h3><p>{task.description}</p><p className="inline-note">{task.primary_team_name??"Administrator assignment review"} · {task.service_id}</p><small>{task.evidence_ids.length} evidence snapshots · {task.project_id ? projectLabel(task.project_id) : "Workspace"}</small>
       </button>)}</div>
       {!filtered.length&&<section className="panel empty-state"><ClipboardCheck/><h3>No tasks in this view</h3><p>Only verified actionable findings create remediation work. Dependencies and unverified risks do not create assignments.</p></section>}
     </>}
@@ -93,7 +94,7 @@ export function TaskWorkspace({workspaceId, scope, request, initialTaskId, notif
       <div className="task-badges"><span className={`priority-badge priority-${selected.priority.toLowerCase()}`}>{selected.priority}</span><span className="run-status">{label(selected.status)}</span></div>
       <h2>{selected.title}</h2><p>{selected.description}</p>
       <div className="task-detail-grid"><section><h3>Required action</h3><p>{selected.required_action}</p><h3>Impact</h3><p>{selected.finding.impact}</p><h3>Acceptance criteria</h3><ul>{selected.acceptance_criteria.map(value=><li key={value}>{value}</li>)}</ul></section>
-      <section><h3>Responsibility</h3><p>{selected.primary_team_name??"Administrator review required"}</p><p className="inline-note">{selected.finding.ownership.explanation}</p><p>{selected.assignment_reason}</p><p className="inline-note">Supporting teams: {selected.supporting_team_ids.join(", ")||"None recorded"}<br/>Service: {selected.service_id}<br/>Project: {selected.project_id??"Unspecified"}<br/>Assigned person: {selected.assigned_subject??"Team assignment"}</p><button className="quiet-button" onClick={()=>openInvestigation(selected.investigation_id)}>Open source investigation <ArrowRight size={14}/></button></section></div>
+      <section><h3>Responsibility</h3><p>{selected.primary_team_name??"Administrator review required"}</p><p className="inline-note">{selected.finding.ownership.explanation}</p><p>{selected.assignment_reason}</p><p className="inline-note">Supporting teams: {selected.supporting_team_ids.join(", ")||"None recorded"}<br/>Service: {selected.service_id}<br/>Project: {selected.project_id ? projectLabel(selected.project_id) : "Unspecified"}<br/>Assigned person: {selected.assigned_subject??"Team assignment"}</p><button className="quiet-button" onClick={()=>openInvestigation(selected.investigation_id)}>Open source investigation <ArrowRight size={14}/></button></section></div>
       <h3>Supporting evidence · {detail.evidence.length}</h3>
       {detail.evidence.map(item=><details className="task-evidence" key={item.evidence_id}><summary><SourceLabel id={item.source_id}/> · {item.record_id}</summary><p className="inline-note">{item.kind} · {item.locator}</p><pre>{item.excerpt}</pre></details>)}
       <section className="resolution-progress"><h3>Progress and independent verification</h3><p className="inline-note">Resolved records the team's progress. Verified requires a separate deterministic check against current source evidence. Verification: {label(selected.resolution_verification)}</p>

@@ -1,3 +1,4 @@
+import { projectLabel } from "../workspace/projectNames";
 ﻿import {
   Fingerprint,
   PanelLeftClose,
@@ -56,10 +57,10 @@ export function WorkspaceSidebar({
       </div>
       <div
         className="sidebar-workspace"
-        title={`${context.company.name} / ${project?.name ?? "No active project"}`}
+        title={`${context.company.name} / ${project ? projectLabel(project.id, project.name) : "No active project"}`}
       >
         <strong>{context.company.name}</strong>
-        <span>{project?.name ?? "No active project"}</span>
+        <span>{project ? projectLabel(project.id, project.name) : "No active project"}</span>
         <small>
           <ShieldCheck size={11} />
           {context.role} · Scoped access

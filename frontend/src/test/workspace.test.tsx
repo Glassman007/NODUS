@@ -53,6 +53,28 @@ it('omits switching for a single authorized project', async () => {
   await enter()
   expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
 })
+it('shows friendly project labels while switching with canonical IDs', async () => {
+  resolve.mockResolvedValue({ ...base, projects: [
+    { id: 'NEX-PRJ-PAY', name: 'NEX-PRJ-PAY' },
+    { id: 'NEX-PRJ-COM', name: 'NEX-PRJ-COM' },
+    { id: 'NEX-PRJ-ID', name: 'NEX-PRJ-ID' },
+    { id: 'NEX-PRJ-DATA', name: 'NEX-PRJ-DATA' },
+  ] })
+  const user = userEvent.setup()
+  render(<App />)
+  await user.type(screen.getByLabelText('Access token'), 'opaque{Enter}')
+  expect(await screen.findByRole('heading', { name: 'Payment' })).toBeVisible()
+  const picker = screen.getByLabelText('Switch project')
+  expect(screen.getAllByRole('option').map(option => option.textContent)).toEqual([
+    'Choose an authorized project', 'Payment', 'Commerce', 'Identity', 'Data',
+  ])
+  expect(picker).toHaveValue('NEX-PRJ-PAY')
+  await user.selectOptions(picker, 'NEX-PRJ-COM')
+  expect(await screen.findByRole('heading', { name: 'Commerce' })).toBeVisible()
+  expect(picker).toHaveValue('NEX-PRJ-COM')
+  expect(screen.queryByText('NEX-PRJ-COM')).not.toBeInTheDocument()
+  expect(resolve).toHaveBeenCalledTimes(2)
+})
 it('shows restricted access without objective entry for zero projects', async () => {
   resolve.mockResolvedValue({ ...base, projects: [] })
   const user = userEvent.setup()

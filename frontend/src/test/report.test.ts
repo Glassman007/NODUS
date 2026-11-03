@@ -8,6 +8,8 @@ import {
   evidenceStatus,
   exportMarkdown,
   reportTitle,
+  claimStatus,
+  verificationCounts,
 } from "../investigations/report";
 import type { WorkspaceRequest } from "../auth/models";
 const run: SessionRun = {
@@ -26,13 +28,25 @@ const run: SessionRun = {
   created: "2026-11-01T10:00:00Z",
 };
 describe("report presentation keeps original records intact", () => {
-  it("derives a bounded title without changing the original objective", () => {
+  it("derives a concise title without changing the original objective", () => {
     const original = run.objective;
-    expect(reportTitle(run)).toBe("Investigate commerce dependencies.");
-    expect(
-      reportTitle({ ...run, objective: "x ".repeat(200) }).length,
-    ).toBeLessThanOrEqual(74);
+    expect(reportTitle(run)).toBe("Service Dependencies & Interface Risks");
+    expect(reportTitle({ objective: "x ".repeat(200) })).toBe("Investigation Report");
+    expect(reportTitle({ objective: "1. Trace payment API dependencies.\n2. Cite all evidence." })).toBe("Payment API dependencies");
+    expect(reportTitle({ objective: "" })).toBe("Investigation Report");
+    expect(reportTitle({ objective: original, title: "Ownership Risks" })).toBe("Ownership Risks");
     expect(run.objective).toBe(original);
+  });
+  it("keeps graph verification distinct from narrative and actionable problems", () => {
+    const finding = { finding_id: "fact", claim: "A depends on B", claim_type: "GRAPH_RELATIONSHIP", verification_status: "SUPPORTED", evidence_ids: ["ev_1"], entity_ids: ["a", "b"], relationship_ids: ["edge"], explanation: "Exact edge re-read" };
+    const result = { ...run, evidence_refs: ["source:record"], structured_findings: [finding, { ...finding, finding_id: "narrative", claim_type: "NARRATIVE", verification_status: "UNVERIFIED" }] };
+    expect(verificationCounts(result)).toEqual({ facts: 1, actionable: 0 });
+    expect(result.evidence_refs).toHaveLength(1);
+    expect(claimStatus("INFERRED")).toBe("PARTIALLY_SUPPORTED");
+    expect(claimStatus("STALE")).toBe("UNVERIFIED");
+    expect(claimStatus("CONTRADICTED")).toBe("CONTRADICTED");
+    expect(exportMarkdown(result, null, [])).toContain("VERIFIED (recorded: SUPPORTED)");
+    expect(exportMarkdown(result, null, [])).toContain("Relationships: edge");
   });
   it("keeps complete execution separate from evidence verification", () => {
     expect(evidenceStatus(run)).toBe("Evidence verification unavailable");
@@ -44,7 +58,7 @@ describe("report presentation keeps original records intact", () => {
     const md = exportMarkdown(run, null, [
       { source_id: "source", name: "Service Catalog" },
     ]);
-    expect(md).toContain("# Investigate commerce dependencies.");
+    expect(md).toContain("# Service Dependencies & Interface Risks");
     expect(md).toContain(run.objective);
     expect(md).toContain("Service Catalog");
     expect(md).toContain("Evidence verification unavailable");

@@ -1,3 +1,4 @@
+import { projectLabel } from "../workspace/projectNames";
 import { reportTitle } from "../investigations/report";
 import { Activity, ArrowUpRight, FileCheck2 } from "lucide-react";
 import type { Run } from "./AuthorizedWorkspace";
@@ -30,7 +31,7 @@ export function SessionActivity({
                   <span className={`run-status ${run.status.toLowerCase()}`}>
                     {run.status}
                   </span>{" "}
-                  {projectId} · {run.selectedSourceIds.length} selected sources{" "}
+                  {projectLabel(projectId)} · {run.selectedSourceIds.length} selected sources{" "}
                   <time dateTime={run.created}>
                     {new Date(run.created).toLocaleString()}
                   </time>

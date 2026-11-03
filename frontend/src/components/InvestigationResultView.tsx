@@ -1,3 +1,4 @@
+import { projectLabel } from "../workspace/projectNames";
 import {
   lazy,
   Suspense,
@@ -18,7 +19,8 @@ import {
 import { loadRunGraph, type RunGraph } from "../investigations/graph";
 import {
   downloadFile,
-  evidenceStatus,
+  claimStatus,
+  verificationCounts,
   exportMarkdown,
   reportTitle,
   type ReportTab,
@@ -76,6 +78,7 @@ export function InvestigationResultView({
   actions,
 }: Props) {
   const catalog = useContext(SourceCatalog);
+  const counts = verificationCounts(run);
   const [graph, setGraph] = useState<RunGraph | null>(null);
   const [graphError, setGraphError] = useState("");
   const [retry, setRetry] = useState(0);
@@ -160,14 +163,14 @@ export function InvestigationResultView({
         <p className="section-kicker">INVESTIGATION REPORT · SESSION RESULT</p>
         <h2>{reportTitle(run)}</h2>
         <p className="report-subtitle">
-          {run.projectId} · {new Date(run.created).toLocaleString()} ·{" "}
+          {projectLabel(run.projectId)} · {new Date(run.created).toLocaleString()} ·{" "}
           {run.selectedSourceIds.length} selected sources
         </p>
         <div className="report-badges">
           <span className={`run-status ${run.status.toLowerCase()}`}>
             Execution: {run.status}
           </span>
-          <span className="evidence-badge">{evidenceStatus(run)}</span>
+
         </div>
         <div className="report-actions">
           <button className="quiet-button" onClick={() => openGraph()}>
@@ -246,18 +249,6 @@ export function InvestigationResultView({
           ))}
         </div>
       )}
-      <div className="evidence-notice">
-        <strong>
-          {run.verification_status === "PARTIALLY_VERIFIED" ? "Graph facts checked; analysis remains unverified" : run.evidence_refs.length
-            ? "Evidence not independently verified"
-            : "Evidence verification unavailable"}
-        </strong>
-        <p>
-          {run.evidence_refs.length
-            ? "Tool-returned references can be inspected below. Their presence does not independently verify the narrative."
-            : "The investigation returned narrative and graph observations, but no independently verifiable evidence references were returned in the result."}
-        </p>
-      </div>
       {run.status !== "COMPLETE" && (
         <div className="notice result-condition" role="status">
           {run.status === "BLOCKED"
@@ -402,20 +393,23 @@ export function InvestigationResultView({
         {tab === "ownership" && <OwnershipActions run={run} scope={scope} request={request} openTask={openTask}/>}
         {tab === "evidence" && (
           <>
+            <p>{run.evidence_refs.length} evidence references | {counts.facts} verified facts | {counts.actionable} verified actionable findings</p>
+            {!run.structured_findings?.length && <p className="inline-note">This report has no recorded claim verification. Existing references remain available below. Run a new investigation to capture claim-to-evidence verification records.</p>}
             {!!run.actionable_findings?.length&&<section><h3>Evidence for actionable findings</h3>{run.actionable_findings.map(problem=><article className="resolution-finding" key={problem.problem_id}>
               <h4>{problem.title}</h4><p>{problem.verification_status} · {problem.evidence_ids.length} problem evidence snapshots</p>
               {problem.evidence_ids.map(id=>{const item=run.evidence_registry?.find(snapshot=>snapshot.evidence_id===id);return item?<details key={id}><summary><SourceLabel id={item.source_id}/> · {item.record_id}</summary><pre className="raw-data">{item.excerpt}</pre></details>:<p key={id}>Evidence is unavailable.</p>;})}
             </article>)}</section>}
             {!!run.structured_findings?.length && <section>
               <h3>Claim verification</h3>
-              <p>Verification: {run.verification_status}. Generated analysis is assessed separately from exact graph facts.</p>
+
               <p className="inline-note">{Object.entries(run.verification_summary ?? {}).map(([status, count]) => `${status.replaceAll("_", " ")}: ${count}`).join(" · ")}</p>
               <p className="inline-note">Requested sources: {run.requested_source_ids?.length ?? run.selectedSourceIds.length} · Effective sources: {run.selected_source_ids?.length ?? run.selectedSourceIds.length} · Evidence sources: {Object.keys(run.source_usage ?? {}).length}</p>
               {run.structured_findings.map((finding) => <article className="evidence-drilldown" key={finding.finding_id}>
-                <span className={`evidence-badge verification-${finding.verification_status.toLowerCase()}`}>{finding.verification_status === "SUPPORTED" ? "Supported graph fact" : finding.verification_status.replaceAll("_", " ")}</span>
+                <span className={`evidence-badge verification-${finding.verification_status.toLowerCase()}`}>{claimStatus(finding.verification_status)}</span>
                 <p>{finding.claim}</p><p className="inline-note">{finding.explanation}</p>
                 <p className="inline-note">Supporting evidence: {finding.evidence_ids.length} · {finding.verification_status === "INFERRED" ? "Derived relationship" : finding.claim_type === "GRAPH_RELATIONSHIP" ? "Direct observation" : finding.claim_type === "GRAPH_PATH" ? "Recorded connection path" : "Generated analysis"}</p>
-                {!!finding.relationship_ids.length && canReadGraph && <button className="quiet-button" onClick={() => setTab("graph")}>View related graph · {finding.entity_ids.join(" → ")}</button>}
+                <p className="inline-note">Entities: {finding.entity_ids.join(", ") || "None linked"} | Relationships: {finding.relationship_ids.join(", ") || "None linked"} | Recorded status: {finding.verification_status}</p>
+                {!!finding.relationship_ids.length && canReadGraph && <button className="quiet-button" onClick={() => openGraph(finding.entity_ids[0], finding.relationship_ids[0])}>View related graph · {finding.entity_ids.join(" → ")}</button>}
                 {canReadEvidence && finding.evidence_ids.map((id) => {
                   const snapshot = run.evidence_registry?.find((item) => item.evidence_id === id);
                   return snapshot ? <details key={id}><summary>Inspect evidence · <SourceLabel id={snapshot.source_id} /></summary>

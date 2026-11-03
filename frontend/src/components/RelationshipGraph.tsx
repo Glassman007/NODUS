@@ -5,6 +5,11 @@ import { neighbors } from "../investigations/graph";
 import { entityName } from "../investigations/presentation";
 import { SourceLabel } from "./SourceLabel";
 import { WorkspaceData } from "./WorkspaceData";
+import {
+  fitGraph,
+  graphLabels,
+  separateGraphLabels,
+} from "../investigations/graphLayout";
 interface Props {
   graph: RunGraph;
   selectedSources: readonly string[];
@@ -24,11 +29,9 @@ export function RelationshipGraph({
   const container = useRef<HTMLDivElement>(null);
   const wrapper = useRef<HTMLDivElement>(null);
   const cy = useRef<Core | null>(null);
+  const pinned = useRef<string | null>(focusEdgeId ?? null);
   const [selected, setSelected] = useState<GraphNode | GraphEdge | null>(
-    () =>
-      graph.edges.find((edge) => edge.id === focusEdgeId) ??
-      graph.nodes.find((n) => n.id === focusId) ??
-      null,
+    () => graph.edges.find((edge) => edge.id === focusEdgeId) ?? null,
   );
   const [root, setRoot] = useState(
     focusId ??
@@ -37,7 +40,12 @@ export function RelationshipGraph({
       "",
   );
   const [hops, setHops] = useState(1);
-  const [full, setFull] = useState(false);
+  const [full, setFull] = useState(true);
+  const [hovered, setHovered] = useState<{
+    record: GraphNode | GraphEdge;
+    x: number;
+    y: number;
+  } | null>(null);
   const [query, setQuery] = useState("");
   const [type, setType] = useState("");
   const [relation, setRelation] = useState("");
@@ -100,36 +108,35 @@ export function RelationshipGraph({
     unknown,
     provenance,
   ]);
+  const labels = useMemo(() => graphLabels(graph.nodes), [graph.nodes]);
   const layoutOptions = useMemo(
-    () =>
-      full
-        ? {
-            name: "cose",
-            animate: false,
-            randomize: false,
-            nodeRepulsion: () => 18000,
-            idealEdgeLength: () => 130,
-            componentSpacing: 100,
-            padding: 45,
-          }
-        : {
-            name: "concentric",
-            animate: false,
-            concentric: (node: cytoscape.NodeSingular) =>
-              node.id() === root ? 2 : 1,
-            levelWidth: () => 1,
-            minNodeSpacing: 75,
-            spacingFactor: 1.4,
-            padding: 45,
-          },
-    [full, root],
+    () => ({
+      name: "cose",
+      animate: false,
+      randomize: false,
+      nodeDimensionsIncludeLabels: true,
+      nodeRepulsion: (node: cytoscape.NodeSingular) =>
+        32000 + Math.min(node.degree(), 12) * 1800,
+      idealEdgeLength: (edge: cytoscape.EdgeSingular) =>
+        110 + Math.min(edge.source().degree() + edge.target().degree(), 12) * 3,
+      edgeElasticity: () => 140,
+      nodeOverlap: 40,
+      gravity: 0.06,
+      componentSpacing: 70,
+      numIter: 1800,
+      initialTemp: 180,
+      coolingFactor: 0.985,
+      minTemp: 0.3,
+      fit: false,
+    }),
+    [],
   );
   const layout = () => {
     const core = cy.current;
     if (core) {
       core.layout(layoutOptions).run();
-      core.zoom(Math.min(core.zoom(), 1.2));
-      core.center();
+      separateGraphLabels(core, true);
+      fitGraph(core);
     }
   };
   useEffect(() => {
@@ -138,21 +145,29 @@ export function RelationshipGraph({
       container: container.current,
       elements: [
         ...nodes.map((n, index) => ({
-          position: { x: (index % 10) * 160, y: Math.floor(index / 10) * 140 },
-          data: { id: n.id, label: entityName(n), type: n.type },
+          position: {
+            x: Math.cos(index * 2.39996) * Math.sqrt(index + 1) * 80,
+            y: Math.sin(index * 2.39996) * Math.sqrt(index + 1) * 80,
+          },
+          data: {
+            id: n.id,
+            label: labels.get(n.id),
+            fullLabel: entityName(n),
+            type: n.type,
+          },
         })),
         ...edges.map((e) => ({
           data: {
             id: e.id,
             source: e.source_id,
             target: e.target_id,
-            label: e.type.replaceAll("_", " ").toLowerCase(),
           },
         })),
       ],
-      layout: layoutOptions,
+      layout: { name: "preset" },
       minZoom: 0.12,
       maxZoom: 3,
+      wheelSensitivity: 0.22,
       style: [
         {
           selector: "node",
@@ -160,13 +175,15 @@ export function RelationshipGraph({
             "background-color": "#718fa7",
             label: "data(label)",
             color: "#d6e3ed",
-            "font-size": 11,
-            "text-wrap": "wrap",
-            "text-max-width": "120px",
+            "font-size": 13,
+            "font-family": "system-ui",
+            "text-wrap": "none",
+            "text-outline-width": 2,
+            "text-outline-color": "#101820",
             "text-valign": "bottom",
             "text-margin-y": 10,
-            width: 28,
-            height: 28,
+            width: (node: cytoscape.NodeSingular) => 34 + Math.min(node.degree(), 8) * 1.5,
+            height: (node: cytoscape.NodeSingular) => 34 + Math.min(node.degree(), 8) * 1.5,
             "border-width": 2,
             "border-color": "#273e50",
           },
@@ -176,8 +193,6 @@ export function RelationshipGraph({
           style: {
             "background-color": "#b6df78",
             shape: "round-rectangle",
-            width: 38,
-            height: 27,
           },
         },
         {
@@ -185,8 +200,6 @@ export function RelationshipGraph({
           style: {
             "background-color": "#8bb8ed",
             shape: "diamond",
-            width: 32,
-            height: 32,
           },
         },
         {
@@ -196,12 +209,13 @@ export function RelationshipGraph({
         {
           selector: "edge",
           style: {
-            width: 1.6,
+            width: 1.2,
             "line-color": "#516575",
             "target-arrow-color": "#718898",
             "target-arrow-shape": "triangle",
             "curve-style": "bezier",
-            label: "data(label)",
+            label: "",
+            opacity: 0.7,
             "font-size": 8,
             color: "#8ba3b5",
             "text-background-color": "#101a24",
@@ -225,9 +239,11 @@ export function RelationshipGraph({
           style: {
             "line-color": "#b2d980",
             "target-arrow-color": "#b2d980",
-            width: 3,
+            width: 2.5,
+            opacity: 1,
           },
         },
+        { selector: ".dimmed", style: { opacity: 0.18 } },
         {
           selector: "node.highlight",
           style: { "border-color": "#b2d980", "border-width": 3 },
@@ -239,28 +255,64 @@ export function RelationshipGraph({
       ],
     });
     cy.current = core;
-    core.zoom(Math.min(core.zoom(), 1.2));
-    core.center();
-    if (focusEdgeId) {
-      const edge = core.getElementById(focusEdgeId);
-      edge.select();
-      edge.connectedNodes().addClass("highlight");
-    }
-    if (focusId) {
-      const initial = core.getElementById(focusId);
-      initial.select();
-      initial.closedNeighborhood().addClass("highlight");
-    }
-    core.on("tap", "node", (event) => {
-      setSelected(nodeById.get(event.target.id()) ?? null);
-      core.elements().removeClass("highlight");
-      event.target.closedNeighborhood().addClass("highlight");
+    core.layout(layoutOptions).run();
+    separateGraphLabels(core, true);
+    fitGraph(core);
+    const highlight = (id: string | null) => {
+      core.elements().removeClass("highlight dimmed");
+      if (!id) return;
+      const target = core.getElementById(id);
+      if (!target.length) return;
+      const edgeRelated = target.union(target.connectedNodes());
+      const related = target.isNode() ? target.closedNeighborhood() : edgeRelated;
+      core.elements().not(related).addClass("dimmed");
+      related.addClass("highlight");
+    };
+    core.on("select", "node, edge", (event) => {
+      const target = event.target;
+      pinned.current = target.id();
+      core.elements().not(target).unselect();
+      setSelected(target.isNode()
+        ? nodeById.get(target.id()) ?? null
+        : graph.edges.find(edge => edge.id === target.id()) ?? null);
+      highlight(target.id());
     });
-    core.on("tap", "edge", (event) =>
-      setSelected(graph.edges.find((e) => e.id === event.target.id()) ?? null),
-    );
+    core.on("tap", event => {
+      if (event.target !== core) return;
+      pinned.current = null;
+      core.elements().unselect();
+      setSelected(null);
+      highlight(null);
+    });
+    core.on("mouseover", "node, edge", event => {
+      const target = event.target;
+      const record = target.isNode()
+        ? nodeById.get(target.id())
+        : graph.edges.find(edge => edge.id === target.id());
+      if (!record) return;
+      const position = event.renderedPosition ?? target.renderedPosition();
+      setHovered({
+        record,
+        x: Math.max(12, Math.min(position.x + 16, core.width() - 290)),
+        y: Math.max(12, Math.min(position.y + 16, core.height() - 190)),
+      });
+      highlight(target.id());
+    });
+    core.on("mouseout", "node, edge", () => {
+      setHovered(null);
+      highlight(pinned.current);
+    });
+    core.on("pan zoom", () => setHovered(null));
+    core.on("dragfree", "node", () => separateGraphLabels(core));
+    if (pinned.current && core.getElementById(pinned.current).length) {
+      core.getElementById(pinned.current).select();
+    } else {
+      pinned.current = null;
+      setSelected(null);
+    }
     const resize = new ResizeObserver(() => {
       core.resize();
+      fitGraph(core);
     });
     resize.observe(container.current);
     return () => {
@@ -268,7 +320,7 @@ export function RelationshipGraph({
       core.destroy();
       cy.current = null;
     };
-  }, [graph, nodes, edges, nodeById, focusId, focusEdgeId, layoutOptions]);
+  }, [graph, nodes, edges, nodeById, focusId, focusEdgeId, layoutOptions, labels]);
   useEffect(() => {
     const core = cy.current;
     if (!core) return;
@@ -277,7 +329,7 @@ export function RelationshipGraph({
       core
         .nodes()
         .filter((n) =>
-          `${n.data("label")} ${n.id()}`
+          `${n.data("fullLabel")} ${n.id()}`
             .toLowerCase()
             .includes(query.toLowerCase()),
         )
@@ -289,11 +341,16 @@ export function RelationshipGraph({
     return () => document.removeEventListener("fullscreenchange", handler);
   }, []);
   const focus = (id: string) => {
+    pinned.current = id;
     setRoot(id);
-    setFull(false);
-    setHops(1);
-    setType("");
     setSelected(nodeById.get(id) ?? null);
+    const core = cy.current;
+    if (core) {
+      const node = core.getElementById(id);
+      core.elements().unselect();
+      node.select();
+      core.animate({ center: { eles: node }, duration: 250 });
+    }
   };
   const isEdge = (value: GraphNode | GraphEdge): value is GraphEdge =>
     "source_id" in value;
@@ -420,14 +477,22 @@ export function RelationshipGraph({
         selected sources. {graph.edges.filter((e) => !e.source_id_ref).length}{" "}
         have no source provenance.
       </p>
-      <div className="graph-split">
+      <div className="graph-unified">
         <div className="graph-stage">
           <div
             ref={container}
             className="graph-canvas"
             aria-label={`Interactive relationship graph: ${nodes.length} nodes and ${edges.length} relationships`}
             role="img"
+            onDoubleClick={layout}
           />
+          {hovered&&<div className="graph-hover-card" role="tooltip" style={{left:hovered.x,top:hovered.y}}>
+            {isEdge(hovered.record)?<>
+              <strong>{hovered.record.type.replaceAll("_"," ")}</strong>
+              <span>{entityName(nodeById.get(hovered.record.source_id)??{id:hovered.record.source_id,name:null})} → {entityName(nodeById.get(hovered.record.target_id)??{id:hovered.record.target_id,name:null})}</span>
+              <small>{hovered.record.source_id_ref&&hovered.record.record_id?`${hovered.record.source_id_ref}:${hovered.record.record_id}`:"Record provenance unavailable"}</small>
+            </>:<><strong>{entityName(hovered.record)}</strong><span>{hovered.record.type??"Entity"}</span><small>{hovered.record.id}</small></>}
+          </div>}
           <div className="graph-controls">
             <button
               aria-label="Zoom graph in"
@@ -441,7 +506,7 @@ export function RelationshipGraph({
             >
               −
             </button>
-            <button onClick={() => cy.current?.fit(undefined, 40)}>Fit</button>
+            <button onClick={() => {if(cy.current)fitGraph(cy.current);}}>Fit</button>
             <button onClick={layout}>Reset layout</button>
             <button
               onClick={() => {

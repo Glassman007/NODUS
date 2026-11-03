@@ -8,7 +8,7 @@ import {
   excerpt,
   overviewPassages,
 } from "../investigations/presentation";
-import type { ReportTab } from "../investigations/report";
+import { verificationCounts, type ReportTab } from "../investigations/report";
 export function ReadableExcerpt({
   text,
   nodes,
@@ -42,6 +42,7 @@ export function ExecutiveOverview({
   setTab: (tab: ReportTab) => void;
 }) {
   const extracted = overviewPassages(run);
+  const counts = verificationCounts(run);
   const relevant = nodes
     .filter((node) => node.type === "SERVICE" || node.type === "CONTRACT")
     .sort((a, b) => {
@@ -178,12 +179,9 @@ export function ExecutiveOverview({
         </span>
       </section>
       <section className="reader-limitations">
-        <h3>Evidence and limitations</h3>
-        <p>
-          {run.evidence_refs.length
-            ? `${run.evidence_refs.length} source references were returned and can be inspected. Their presence does not independently verify the model's claims.`
-            : "No independently verifiable evidence references were returned. The analysis describes graph observations and model interpretations, not proven implementation behavior."}
-        </p>
+        <h3>Evidence</h3>
+        <p>{run.evidence_refs.length} evidence references | {counts.facts} verified facts | {counts.actionable} verified actionable findings</p>
+        <button className="quiet-button" onClick={() => setTab("evidence")}>Review claims and sources</button>
         {run.source_coverage_limitations.length > 0 && (
           <ul>
             {run.source_coverage_limitations.slice(0, 3).map((text, index) => (
@@ -193,9 +191,6 @@ export function ExecutiveOverview({
             ))}
           </ul>
         )}
-        <p>
-          Claim-to-evidence mappings are not supplied by this investigation API.
-        </p>
       </section>
       <section className="reader-section explore-further">
         <h3>Explore further</h3>
