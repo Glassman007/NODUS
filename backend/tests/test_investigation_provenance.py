@@ -52,6 +52,8 @@ def test_write_only_grant_cannot_supply_investigation_content():
     from backend.app.governance.identity import investigation_read_principal, NEXUS_TENANT_ID
     class Grants:
         def read(self, sql, params=()):
+            if "SELECT source_id FROM nexus_sources WHERE selectable" in sql:
+                return []
             if "SELECT resource_id" in sql:
                 return [{"resource_id": "selected"}]
             if "SELECT data" in sql:

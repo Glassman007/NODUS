@@ -5,17 +5,21 @@ its existing read methods.
 """
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
 from backend.app.governance.identity import recipient_authorized_sources
 from backend.app.graph.models import Entity, Relationship
-from backend.app.graph.repository import GraphRepository
+from backend.app.graph.repository import GraphRepository, normalize_entity_reference
 from backend.app.security import AuthorizationContext, Permission
 from backend.app.tools.contracts import ExecutionLimits
 from backend.app.tools.registry import SideEffect, ToolDependencies, ToolRegistry, ToolSpec
 
 GRAPH_ENTITY_LOOKUP_TOOL_ID = "graph.entity_lookup"
 GRAPH_ENTITY_LOOKUP_VERSION = "1.0.0"
+GRAPH_SEARCH_ENTITIES_TOOL_ID = "graph.search_entities"
+GRAPH_SEARCH_ENTITIES_VERSION = "1.0.0"
 GRAPH_NEIGHBORHOOD_TOOL_ID = "graph.neighborhood"
 GRAPH_NEIGHBORHOOD_VERSION = "1.0.0"
 GRAPH_FIND_PATHS_TOOL_ID = "graph.find_paths"
@@ -45,6 +49,98 @@ def _entity_lookup_handler(context: AuthorizationContext, input_model: GraphEnti
     if entity is None:
         return None
     return {"entity": entity, "graph_revision": repo.graph_revision()}
+
+
+class GraphSearchEntitiesInput(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+    limit: int = Field(default=10, ge=1, le=25)
+
+
+class GraphSearchEntitiesOutput(BaseModel):
+    status: str  # "RESOLVED" | "AMBIGUOUS"
+    resolved_entity: Entity | None = None
+    candidates: list[Entity] = Field(default_factory=list)
+
+
+def _search_entities_handler(context: AuthorizationContext, input_model: GraphSearchEntitiesInput,
+                             dependencies: ToolDependencies) -> dict | None:
+    """Deterministic, permission-aware resolution of a human-readable entity
+    reference (canonical id, registered name, or alias) to the actual graph
+    entity/entities it denotes -- see ``skills/graph-trace/SKILL.md`` for why
+    this exists: the model must never guess a canonical id from the
+    objective's prose.
+
+    Authorization is never weakened here: every candidate comes from
+    ``GraphRepository.get_entity``/``search``, already scoped to this
+    context's tenant/workspace/ACL/``authorized_source_ids`` exactly like
+    every other graph tool -- an unauthorized entity can never appear as a
+    candidate, a count, or in any error message.
+    """
+    repo = _repository(context, dependencies)
+    query = input_model.query.strip()
+    if not query:
+        return None
+
+    # Tracks, per candidate id, whether it was found by a search anchored on the caller's FULL query
+    # text (exact id, or a direct substring search of ``query`` itself) rather than only via the looser
+    # per-token fallback below -- a single shared generic word ("service", "api") from a multi-word
+    # fake reference must never by itself promote an unrelated real entity into the result.
+    pool: dict[str, Entity] = {}
+    direct_hit_ids: set[str] = set()
+
+    # 1. Exact canonical id -- the fast path when the caller already has the real id; never guessed.
+    exact = repo.get_entity(query)
+    if exact is not None:
+        pool[exact.id] = exact
+        direct_hit_ids.add(exact.id)
+
+    # 2. Broad, authorized, case-insensitive substring search over id/name, anchored on the query as a
+    #    whole (handles the common case -- "Identity", "identity" -- with no normalization needed).
+    fetch_limit = max(input_model.limit * 4, 20)
+    for entity in repo.search(query, limit=fetch_limit)["items"]:
+        pool.setdefault(entity.id, entity)
+        direct_hit_ids.add(entity.id)
+
+    # 3. Separator-insensitive fallback for a query like "identity-service": re-run the SAME authorized
+    #    search per alphanumeric token (longest first), never inventing a new id format -- just trying
+    #    simpler substrings of what the caller already typed. A candidate found ONLY this way is kept
+    #    below only if it also has a real normalized relationship to the FULL query (see ``score``) --
+    #    never merely because it happens to share one generic token.
+    tokens = sorted({t for t in re.split(r"[^a-zA-Z0-9]+", query) if len(t) >= 3}, key=len, reverse=True)
+    for token in tokens[:3]:
+        if len(pool) >= fetch_limit:
+            break
+        for entity in repo.search(token, limit=fetch_limit)["items"]:
+            pool.setdefault(entity.id, entity)
+
+    if not pool:
+        return None
+
+    normalized_query = normalize_entity_reference(query)
+
+    def score(entity: Entity) -> int:
+        normalized_fields = {normalize_entity_reference(value) for value in (entity.id, entity.name or "") if value}
+        if normalized_query in normalized_fields:
+            return 3
+        if any(field and (field.startswith(normalized_query) or normalized_query.startswith(field))
+               for field in normalized_fields):
+            return 2
+        return 1
+
+    relevant = [entity for entity in pool.values() if entity.id in direct_hit_ids or score(entity) >= 2]
+    if not relevant:
+        return None
+
+    scored = sorted(((score(entity), entity) for entity in relevant), key=lambda item: item[0], reverse=True)
+    top_score = scored[0][0]
+    top = [entity for value, entity in scored if value == top_score]
+    bounded_candidates = [entity for _, entity in scored[:input_model.limit]]
+
+    if len(top) == 1:
+        return {"status": "RESOLVED", "resolved_entity": top[0], "candidates": bounded_candidates,
+                "graph_revision": repo.graph_revision()}
+    return {"status": "AMBIGUOUS", "resolved_entity": None, "candidates": bounded_candidates,
+            "graph_revision": repo.graph_revision()}
 
 
 class GraphNeighborhoodInput(BaseModel):
@@ -174,6 +270,23 @@ def register_graph_tools(registry: ToolRegistry) -> None:
         limits=ExecutionLimits(max_input_bytes=1024, max_output_bytes=32768,
                                max_result_count=1, timeout_seconds=10.0),
         requires_approval=False,
+        capabilities=frozenset({"graph.read"}),
+        dependencies=frozenset({"graph_store"}),
+    ))
+    registry.register(ToolSpec(
+        tool_id=GRAPH_SEARCH_ENTITIES_TOOL_ID,
+        version=GRAPH_SEARCH_ENTITIES_VERSION,
+        description="Resolve a human-readable entity reference (canonical id, registered name, or "
+                    "alias/punctuation variant) to the authorized graph entity/entities it denotes. "
+                    "Returns status RESOLVED with one entity, or AMBIGUOUS with a bounded candidate list "
+                    "-- never guesses or silently picks among multiple matches.",
+        input_model=GraphSearchEntitiesInput,
+        output_model=GraphSearchEntitiesOutput,
+        handler=_search_entities_handler,
+        required_permissions=frozenset({Permission.READ_GRAPH}),
+        side_effect=SideEffect.READ_ONLY,
+        limits=ExecutionLimits(max_input_bytes=1024, max_output_bytes=131072,
+                               max_result_count=25, timeout_seconds=12.0),
         capabilities=frozenset({"graph.read"}),
         dependencies=frozenset({"graph_store"}),
     ))

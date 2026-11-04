@@ -199,6 +199,38 @@ class DeterministicToolAdapter(BaseTool):
             return {"error": "Per-run tool call limit reached; stop calling tools and summarize what you "
                              "have so far."}
 
+        # Never spend budget re-querying the backing store for an entity this run already confirmed is
+        # NOT_FOUND -- the model sometimes retries the same lookup (e.g. after a different tool's output
+        # re-mentions the id). Still recorded as a tool call (so max_tool_calls remains a real, bounded
+        # ceiling on retries) but answered from this run's own prior result, never the live store again.
+        retried_entity_id = (args or {}).get("entity_id")
+        if isinstance(retried_entity_id, str) and retried_entity_id in run_state.not_found_entity_ids:
+            from backend.app.tools.contracts import ToolResult, ToolStatus
+            cached_result = ToolResult(
+                tool_id=self.spec.tool_id, version=self.spec.version,
+                correlation_id=run_state.exec_context.run_id, status=ToolStatus.NOT_FOUND,
+                error_category="already_not_found_this_run")
+            run_state.record_tool_result(self.spec.tool_id, self.spec.version, cached_result, arguments=args)
+            return {**cached_result.model_dump(mode="json"), "evidence_ids": (), "retrieved_records": [],
+                    "message": f"{retried_entity_id!r} was already looked up and confirmed NOT_FOUND earlier "
+                              f"in this run; not retried."}
+
+        # Same dedup for a name/alias search (``graph.search_entities``) that already matched no
+        # authorized entity this run -- never re-query the store for a trivial reword of the same text.
+        retried_query = (args or {}).get("query")
+        if isinstance(retried_query, str) and retried_query:
+            from backend.app.graph.repository import normalize_entity_reference
+            if normalize_entity_reference(retried_query) in run_state.not_found_search_queries:
+                from backend.app.tools.contracts import ToolResult, ToolStatus
+                cached_result = ToolResult(
+                    tool_id=self.spec.tool_id, version=self.spec.version,
+                    correlation_id=run_state.exec_context.run_id, status=ToolStatus.NOT_FOUND,
+                    error_category="already_not_found_this_run")
+                run_state.record_tool_result(self.spec.tool_id, self.spec.version, cached_result, arguments=args)
+                return {**cached_result.model_dump(mode="json"), "evidence_ids": (), "retrieved_records": [],
+                        "message": f"{retried_query!r} was already searched earlier in this run and matched "
+                                  f"no authorized entity; not retried."}
+
         invocation = ToolInvocation(
             tool_id=self.spec.tool_id, version=self.spec.version, arguments=args or {},
             context=refresh_authorization(run_state.exec_context.authorization, run_state.tool_executor),

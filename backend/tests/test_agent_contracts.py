@@ -41,11 +41,11 @@ def test_agent_execution_context_defaults_are_maximum_and_explicit():
         ),
     )
 
-    assert context.limits.max_llm_calls == 50
-    assert context.limits.max_tool_calls == 100
+    assert context.limits.max_llm_calls == 250
+    assert context.limits.max_tool_calls == 1250
     assert context.limits.max_output_tokens_per_call == 65536
     assert context.limits.max_total_tokens_per_call == 200000
-    assert context.limits.overall_timeout_seconds == 600.0
+    assert context.limits.overall_timeout_seconds == 1800.0
     assert context.model_role == ModelRole.DEFAULT
 
 
@@ -53,7 +53,7 @@ def test_runtime_limits_are_bounded():
     with pytest.raises(Exception):
         RuntimeLimits(max_llm_calls=0)
     with pytest.raises(Exception):
-        RuntimeLimits(max_llm_calls=1000)  # exceeds the le=50 cap
+        RuntimeLimits(max_llm_calls=10_000)  # exceeds the le=500 cap
 
 
 def test_investigation_request_requires_a_nonempty_question():

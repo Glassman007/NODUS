@@ -2,6 +2,7 @@
   "version": "1.0.0",
   "required_capabilities": ["graph.read"],
   "compatible_tools": [
+    {"tool_id": "graph.search_entities", "version": "1.0.0"},
     {"tool_id": "graph.entity_lookup", "version": "1.0.0"},
     {"tool_id": "graph.revision", "version": "1.0.0"},
     {"tool_id": "graph.neighborhood", "version": "1.0.0"},
@@ -10,6 +11,6 @@
     {"tool_id": "graph.relationship_lookup", "version": "1.0.0"}
   ],
   "effect": "READ_ONLY",
-  "input_expectations": "A starting entity_id, and optionally a target entity_id for path queries.",
+  "input_expectations": "A starting entity reference -- a human-readable name/alias and/or an unverified entity_id hint -- and optionally a second entity reference for path queries.",
   "output_expectations": "Bounded nodes/relationships/paths labeled by origin (source_asserted/observed/inferred), current vs historical, with truncation and graph revision reported."
 }

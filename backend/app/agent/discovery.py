@@ -43,6 +43,7 @@ from backend.app.agent.contracts import (
     RuntimeLimits,
 )
 from backend.app.agent.investigator import run_investigation
+from backend.app.agent.limits_config import default_runtime_limits
 from backend.app.contracts import Record
 from backend.app.gateway.gateway import ModelGateway
 from backend.app.governance.identity import authorized_source_ids_for, NEXUS_TENANT_ID
@@ -97,8 +98,10 @@ class DiscoveryOutcome(Record):
     rejected: tuple[CandidateRejection, ...] = ()
 
 
-def effective_source_scope(selected_source_ids: Sequence[str], principal: Principal) -> frozenset[str]:
-    """``selected_source_ids ∩ principal's currently authorized source_ids``.
+def effective_source_scope(selected_source_ids: Sequence[str], principal: Principal, *,
+                           always_included_source_ids: frozenset[str] = frozenset()) -> frozenset[str]:
+    """``selected_source_ids ∩ principal's currently authorized source_ids``,
+    plus ``always_included_source_ids``.
 
     ADMIN and a principal with no explicit ``source_ids`` restriction of its
     own are bounded by the caller's selection alone (there is nothing else to
@@ -106,10 +109,23 @@ def effective_source_scope(selected_source_ids: Sequence[str], principal: Princi
     ``authorized_source_ids_for`` (NEXUS governance-derived access) and its
     own ``source_ids``. Anything the caller selects outside this is silently
     dropped, never promoted to "authorized by asking for it".
+
+    ``always_included_source_ids`` (e.g. ``backend.app.governance.identity.
+    non_selectable_source_ids`` intersected with the principal's own
+    ``source_ids`` by the caller) covers sources the UI never offers the
+    caller a way to put in ``selected_source_ids`` at all -- the
+    company-foundation scaffold holding the organization/project/service
+    catalog. Without this, that scaffold would be silently excluded from
+    every selection-scoped investigation (it can never appear in a real
+    selection), even though the principal is already authorized for it. A
+    totally empty ``selected_source_ids`` still blocks the investigation
+    (unchanged) -- this only restores the scaffold once the caller selected
+    at least one real source.
     """
     selected = frozenset(source_id for source_id in selected_source_ids if source_id)
     if not selected:
         return frozenset()
+    selected = selected | frozenset(always_included_source_ids)
     governance_scope = authorized_source_ids_for(principal)
     own_scope = frozenset(principal.source_ids) if principal.source_ids or principal.tenant_id == NEXUS_TENANT_ID else None
     if governance_scope is None and own_scope is None:
@@ -147,11 +163,17 @@ async def run_scoped_investigation(
     """
     from backend.app.governance.identity import refresh_principal_source_ids
     governance = tool_executor.dependencies.governance_store
+    always_included_source_ids: frozenset[str] = frozenset()
     if governance is not None:
         principal = refresh_principal_source_ids(principal, governance)
-        from backend.app.governance.identity import investigation_read_principal
+        from backend.app.governance.identity import investigation_read_principal, non_selectable_source_ids
         principal = investigation_read_principal(principal, tuple(selected_source_ids), project_id, governance)
-    scope = effective_source_scope(selected_source_ids, principal)
+        # Bounded to what investigation_read_principal just confirmed this principal may actually read --
+        # never broadens access, only stops the selection intersection below from excluding a source
+        # (the company-foundation scaffold) the caller was never offered a way to select in the first place.
+        always_included_source_ids = non_selectable_source_ids(governance) & frozenset(principal.source_ids)
+    scope = effective_source_scope(selected_source_ids, principal,
+                                   always_included_source_ids=always_included_source_ids)
     if scope:
         scope = GraphRepository(graph_store, principal.tenant_id, workspace_id, principal.subject,
             allow_all=Permission.ADMIN in principal.permissions,
@@ -174,7 +196,8 @@ async def run_scoped_investigation(
         principal=scoped_principal, tenant_id=scoped_principal.tenant_id, workspace_id=workspace_id,
         task_id=run_id, permissions=permissions, selected_source_ids=tuple(sorted(scope)), project_id=project_id)
     exec_context = AgentExecutionContext(
-        authorization=auth, run_id=run_id, approved_skills=approved_skills, limits=limits or RuntimeLimits())
+        authorization=auth, run_id=run_id, approved_skills=approved_skills,
+        limits=limits or default_runtime_limits())
     request = InvestigationRequest(question=objective, entity_id=entity_id)
 
     result = await run_investigation(request, exec_context, model_gateway, tool_registry, tool_executor,

@@ -179,14 +179,37 @@ def principal_authorizes_action(principal: Principal, resource_id: str, action: 
     return action in authorized_actions_for(principal, resource_id, store)
 
 
+def non_selectable_source_ids(store: GovernanceStore) -> frozenset[str]:
+    """Sources marked ``selectable=false`` in the registry -- today exactly
+    the company-foundation scaffold (``NEX-SRC-COMPANY_FOUNDATION``, see
+    ``backend.app.governance.store``'s own schema comment: "the 28 selectable
+    sources plus the non-selectable company-foundation scaffold"). A caller
+    is never offered a way to put one of these in its own
+    ``selected_source_ids`` (the UI's source picker only lists
+    ``selectable=true`` rows), so selection-based filtering
+    (``investigation_read_principal``, ``backend.app.agent.discovery.
+    effective_source_scope``) must never require one to be explicitly
+    re-selected to stay in scope -- that would silently exclude
+    organization-wide context (company/project/service/people catalog) from
+    every selection-scoped investigation. Callers still intersect this with
+    the principal's own already-authorized ``source_ids`` before use; this
+    function never grants access by itself."""
+    rows = store.read("SELECT source_id FROM nexus_sources WHERE selectable=false")
+    return frozenset(row["source_id"] for row in rows)
+
+
 def investigation_read_principal(principal: Principal, selected_source_ids: tuple[str, ...] | None,
                                  project_id: str | None, store: GovernanceStore) -> Principal:
     """Narrow fresh governance scope using the shared READ-action policy."""
     if principal.tenant_id != NEXUS_TENANT_ID or not principal.subject.startswith("nexus:"):
         return principal
+    # Bounded to what this principal already holds (``_effective_source_ids``'s own FOUNDATIONAL grant) --
+    # re-adding it after a selection/project intersection below never broadens access, it only stops the
+    # selection mechanism from excluding a source the caller could never have selected in the first place.
+    always_included = non_selectable_source_ids(store) & set(principal.source_ids)
     scope = set(principal.source_ids)
     if selected_source_ids is not None:
-        scope.intersection_update(selected_source_ids)
+        scope = (scope & set(selected_source_ids)) | always_included
     if project_id is not None:
         employee = principal.subject.removeprefix("nexus:")
         projects = store.read("SELECT project_id FROM nexus_project_assignments WHERE project_id=%s LIMIT 1", (project_id,))
@@ -196,7 +219,7 @@ def investigation_read_principal(principal: Principal, selected_source_ids: tupl
         allowed = store.read("""SELECT source_id FROM nexus_sources
             WHERE source_id = ANY(%s) AND (owner_project_id IS NULL OR owner_project_id=%s)
             """, (sorted(scope), project_id))
-        scope.intersection_update(row["source_id"] for row in allowed)
+        scope = (scope & {row["source_id"] for row in allowed}) | always_included
     readable = tuple(sorted(source for source in scope
                             if principal_authorizes_action(principal, source, "READ", store)))
     return principal.model_copy(update={"source_ids": readable})

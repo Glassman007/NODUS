@@ -57,6 +57,7 @@ class RunState:
     observed_conflicts: list[str] = dataclasses.field(default_factory=list)
     observed_source_limitations: list[str] = dataclasses.field(default_factory=list)
     not_found_entity_ids: set[str] = dataclasses.field(default_factory=set)
+    not_found_search_queries: set[str] = dataclasses.field(default_factory=set)
     evidence_registry: dict[str, EvidenceSnapshot] = dataclasses.field(default_factory=dict)
     consumed_source_ids: set[str] = dataclasses.field(default_factory=set)
     retrieved_entities: dict[str, dict] = dataclasses.field(default_factory=dict)
@@ -160,6 +161,10 @@ class RunState:
             entity_id = arguments.get("entity_id")
             if entity_id:
                 self.not_found_entity_ids.add(entity_id)
+            query = arguments.get("query")
+            if isinstance(query, str) and query:
+                from backend.app.graph.repository import normalize_entity_reference
+                self.not_found_search_queries.add(normalize_entity_reference(query))
 
     def usage_summary(self) -> ModelUsageSummary:
         return ModelUsageSummary(

@@ -97,6 +97,7 @@ from backend.app.agent.contracts import (
 from backend.app.agent.freshness import check_freshness, reverify
 from backend.app.agent.handoff import recipient_authorized_sources
 from backend.app.agent.investigator import run_investigation
+from backend.app.agent.limits_config import default_coordinator_budget, default_runtime_limits
 from backend.app.agent.persistence import InvestigationStore, RunClaimDenied
 from backend.app.agent.tool_bridge import refresh_authorization
 from backend.app.agent.verifier import IMPACT_TOOL_BY_SKILL, run_verification_pass
@@ -149,7 +150,13 @@ _IMPACT_SKILL_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # procedure (entity_lookup -> revision -> pr.change_impact -> evidence.lookup, sometimes repeated for a
 # second resource) but running out of TURNS (max_llm_calls) before producing a final answer -- a count
 # ceiling, not a time one. Raised with headroom for that observed step count rather than left to guess.
-_DEFAULT_PASS_LIMITS = RuntimeLimits(max_llm_calls=10, max_tool_calls=8, overall_timeout_seconds=150.0)
+#
+# A later production investigation still hit this ceiling after only 10 LLM calls / 7 tool calls /
+# 21,885 tokens -- nowhere near a genuine provider/evidence limit. Per-pass defaults now come from
+# ``backend.app.agent.limits_config`` (environment-configurable; 250 LLM calls / 1250 tool calls by
+# default) instead of this module's own hardcoded 10/8 -- see that module's docstring for the paired
+# ``CoordinatorBudget`` (per-COMPLETE-investigation) default.
+_DEFAULT_PASS_LIMITS = default_runtime_limits()
 
 # ND-13C section 4: the smallest configurable per-specialist model-selection
 # mechanism compatible with the existing ``RoleRouter``/``ModelGateway`` — no
@@ -583,7 +590,7 @@ async def run_coordinated_investigation(
     continuing an interrupted one (it builds ``resume_from`` itself, after
     its own authorization/claim checks).
     """
-    budget = budget or CoordinatorBudget()
+    budget = budget or default_coordinator_budget()
     model_roles = {**DEFAULT_SPECIALIST_MODEL_ROLES, **(specialist_model_roles or {})}
     resume_from = resume_from or _ResumeSnapshot()
     started_at = time.monotonic() - resume_from.elapsed_seconds

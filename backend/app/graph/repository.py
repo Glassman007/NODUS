@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -10,6 +11,19 @@ from backend.app.graph import ontology
 from backend.app.graph.authority import AuthorityRule, resolve_entity_field_authority
 from backend.app.graph.driver import Neo4jStore
 from backend.app.graph.models import EntityType, Entity, Evidence, GraphPage, Relationship, SourceRecordInput
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def normalize_entity_reference(text: str) -> str:
+    """Lowercases and strips separators (spaces, hyphens, underscores, colons,
+    ...) so "Identity Service", "identity-service" and "identity_service"
+    compare equal. Used only to RANK or CACHE a human-readable reference
+    against an already-authorized candidate's own stored id/name (see
+    ``backend.app.tools.graph_tools._search_entities_handler`` and
+    ``backend.app.agent.run_state``/``tool_bridge``'s repeated-lookup
+    dedup) -- never to construct, guess, or invent a canonical entity id."""
+    return _NON_ALNUM_RE.sub("", text.casefold())
 
 
 def scoped_key(*parts: str) -> str:

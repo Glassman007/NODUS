@@ -5,8 +5,29 @@ compatibility: NODUS deterministic tool layer (Stage 04); no LLM required to exe
 ---
 # Graph trace
 
-1. Resolve the starting entity with `graph.entity_lookup`; if NOT_FOUND,
-   stop and report the path as unknown rather than guessing.
+1. Resolve the starting entity:
+   - If you already have a value that looks like a real canonical id
+     (e.g. an unverified `entity_id` hint from the caller), try
+     `graph.entity_lookup` with it first.
+   - Otherwise, or if that returns NOT_FOUND, call `graph.search_entities`
+     with the human-readable name/reference from the objective (e.g.
+     "Identity", "payment service"). Never guess variations of an id
+     yourself (no trying "identity-service", "service:identity", etc.) --
+     the search tool already normalizes case, punctuation and spacing, and
+     is the only approved way to turn a name into a canonical id.
+   - `graph.search_entities` returns one of:
+     - `status: "RESOLVED"` with one `resolved_entity` -- use its `id` as
+       the canonical starting entity for every following tool call.
+     - `status: "AMBIGUOUS"` with a bounded `candidates` list -- do not
+       silently pick one. Report the candidates (id, name, type) and ask
+       for disambiguation, unless the objective's own wording already
+       names a specific type/context that uniquely picks one candidate.
+     - a `NOT_FOUND` tool result -- no authorized entity matches; report
+       that the referenced entity could not be found (or is not
+       accessible), never that it definitely does not exist anywhere.
+   - If a search for the exact same reference already came back
+     NOT_FOUND/AMBIGUOUS earlier in this investigation, do not repeat it
+     with a trivial rewording -- move on or report it as unresolved.
 2. Record the graph revision via `graph.revision` so results can be
    compared against later state.
 3. Choose the narrowest query for the question:
